@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.next/
+out/
+
+# Environment
+.env
+.env.local
+.env.wallets
+
+# Build
+target/
+dist/
+*.js.map
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Solana
+test-ledger/
+.anchor/
+
+# Logs
+*.log
+wallets/
+wallets/
+node_modules/
+.next/
+wallets/
+.env.local
+.env.example
+.env
+

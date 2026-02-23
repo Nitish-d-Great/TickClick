@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary: #14F195;
+  --secondary: #9945FF;
+}
+
+body {
+  background-color: #0a0a0f;
+  color: #e2e8f0;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #12121a;
+}
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Markdown in chat */
+.chat-markdown p {
+  margin-bottom: 0.5rem;
+}
+.chat-markdown strong {
+  color: #14F195;
+}
+.chat-markdown a {
+  color: #9945FF;
+  text-decoration: underline;
+}
+.chat-markdown code {
+  background: #1a1a25;
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.25rem;
+  font-size: 0.85em;
+}
+
+/* Tool call animation */
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+.tool-running {
+  animation: pulse-glow 1.5s ease-in-out infinite;
+}
+
+/* Typing indicator */
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); }
+  40% { transform: translateY(-6px); }
+}
+.typing-dot {
+  animation: bounce 1.4s infinite ease-in-out;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
