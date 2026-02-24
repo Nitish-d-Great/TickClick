@@ -307,7 +307,11 @@ export function getStaticEventData(): ScrapedEvent[] {
 export async function discoverEvents(): Promise<ScrapedEvent[]> {
   try {
     const events = await scrapeAllVenues();
-    if (events.length > 0) return enrichEventDates(events);
+    if (events.length > 0) {
+      const withDates = enrichEventDates(events);
+      const withPrices = await enrichEventPrices(withDates);
+      return withPrices;
+    }
     console.log("⚠️ No events found via scraping, using static fallback data");
     return getStaticEventData();
   } catch (error) {
@@ -352,4 +356,133 @@ function enrichEventDates(events: ScrapedEvent[]): ScrapedEvent[] {
 
     return event;
   });
+}
+
+/**
+ * Fetch each event's detail page in parallel to get real ticket prices.
+ * KYD detail pages contain price tables with actual ticket costs.
+ * 
+ * Pricing patterns found on KYD:
+ *   - "$38.89" in ticket table → paid event
+ *   - "RSVP (Cover is $10 before 11:30pm at the door)" → $10 cover
+ *   - "Register" with no price → truly free
+ *   - "Sold Out" / "JOIN WAITLIST" → sold out (was paid)
+ */
+async function enrichEventPrices(events: ScrapedEvent[]): Promise<ScrapedEvent[]> {
+  console.log(`💰 Fetching real prices for ${events.length} events...`);
+
+  const results = await Promise.allSettled(
+    events.map(async (event) => {
+      try {
+        // Normalize ticket URL — KYD redirects to kydlabs.com/e/...
+        let url = event.ticketUrl;
+        if (!url || url === event.venueUrl) return event;
+
+        // Ensure full URL
+        if (url.startsWith("/")) {
+          url = `${event.venueUrl}${url}`;
+        }
+
+        const response = await fetch(url, {
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          },
+          redirect: "follow",
+          signal: AbortSignal.timeout(8000), // 8s timeout per event
+        });
+
+        if (!response.ok) return event;
+
+        const html = await response.text();
+
+        // --- Extract price from HTML ---
+        const priceInfo = extractPriceFromHtml(html, event.name);
+        
+        if (priceInfo.price > 0) {
+          event.price = priceInfo.price;
+          event.isFree = false;
+          console.log(`   💲 ${event.name}: $${priceInfo.price} (${priceInfo.type})`);
+        } else if (priceInfo.type === "free") {
+          event.price = 0;
+          event.isFree = true;
+          console.log(`   🆓 ${event.name}: FREE`);
+        } else if (priceInfo.type === "sold_out") {
+          event.isFree = false;
+          console.log(`   🚫 ${event.name}: SOLD OUT`);
+        }
+        // If type is "unknown", keep existing values
+
+        return event;
+      } catch (err: any) {
+        // Timeout or network error — keep existing values
+        console.log(`   ⚠️ ${event.name}: price fetch failed (${err.message?.slice(0, 40)})`);
+        return event;
+      }
+    })
+  );
+
+  // Extract successful results
+  return results.map((r, i) => (r.status === "fulfilled" ? r.value : events[i]));
+}
+
+/**
+ * Parse ticket price from KYD event detail page HTML.
+ */
+function extractPriceFromHtml(
+  html: string,
+  eventName: string
+): { price: number; type: string } {
+  // Pattern 1: All-in price like "$38.89" or "$25.00"
+  // KYD uses "All-In price" text near the price
+  const allInMatch = html.match(/\$([\d]+(?:\.[\d]{2})?)\s*(?:<[^>]*>)*\s*All-In/i);
+  if (allInMatch) {
+    return { price: parseFloat(allInMatch[1]), type: "all_in" };
+  }
+
+  // Pattern 2: Price in ticket table — look for dollar amounts near ticket type names
+  // Match "$XX.XX" that appears in ticket pricing context
+  const ticketPriceMatch = html.match(
+    /(?:GA|General|Standing|Advance|VIP|Table|Premium)[^$]*\$([\d]+(?:\.[\d]{2})?)/i
+  );
+  if (ticketPriceMatch) {
+    return { price: parseFloat(ticketPriceMatch[1]), type: "ticket_table" };
+  }
+
+  // Pattern 3: RSVP with cover charge — "Cover is $10 before..."
+  const coverMatch = html.match(/Cover\s+is\s+\$([\d]+(?:\.[\d]{2})?)/i);
+  if (coverMatch) {
+    return { price: parseFloat(coverMatch[1]), type: "cover_charge" };
+  }
+
+  // Pattern 4: Any dollar amount in the ticket section
+  // Look for prices between "Get Your Tickets" / "Register" and the end of that section
+  const ticketSectionMatch = html.match(
+    /(?:Get Your Tickets|Register|Ticket Type)[^]*?\$([\d]+(?:\.[\d]{2})?)/i
+  );
+  if (ticketSectionMatch) {
+    const price = parseFloat(ticketSectionMatch[1]);
+    if (price > 0 && price < 500) {
+      return { price, type: "section_price" };
+    }
+  }
+
+  // Pattern 5: Sold out detection
+  if (
+    /Sold\s*Out/i.test(html) &&
+    !html.match(/\$([\d]+(?:\.[\d]{2})?)/) // No visible price
+  ) {
+    return { price: 0, type: "sold_out" };
+  }
+
+  // Pattern 6: RSVP with no price at all — truly free or cover at door
+  if (/RSVP\s*Now/i.test(html) && !/\$[\d]/.test(html)) {
+    return { price: 0, type: "free" };
+  }
+
+  // Pattern 7: "Register" page with no dollar signs
+  if (/Register/i.test(html) && !/\$[\d]/.test(html)) {
+    return { price: 0, type: "free" };
+  }
+
+  return { price: 0, type: "unknown" };
 }
