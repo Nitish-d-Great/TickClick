@@ -1,6 +1,7 @@
 // =============================================
 // TickClick — Conversational AI Ticket Agent
 // Uses LLM to decide actions dynamically
+// Executes REAL Solana transactions when configured
 // =============================================
 
 import OpenAI from "openai";
@@ -58,7 +59,7 @@ function getLLMClient() {
 
 const LLM_MODEL = "llama-3.3-70b-versatile";
 
-// --- Classify user intent (what does the user want?) ---
+// --- Classify user intent ---
 
 type UserAction =
   | "greeting"
@@ -83,7 +84,7 @@ async function classifyAction(
         content: `You classify user messages into one action category. Respond with ONLY one of these exact strings, nothing else:
 - "greeting" — user is saying hello, hi, hey, or making casual conversation
 - "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available
-- "book_ticket" — user explicitly wants to book/purchase/reserve tickets for specific people with details like names, budget, dates
+- "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions booking, names, specific events)
 - "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second)
 - "check_calendar" — user specifically asks about calendar availability
 - "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
@@ -102,15 +103,9 @@ ${isAwaitingConfirmation ? "IMPORTANT: The agent just showed event options and i
     .replace(/"/g, "")
     .toLowerCase() as UserAction;
 
-  // Validate it's a known action
   const validActions: UserAction[] = [
-    "greeting",
-    "search_events",
-    "book_ticket",
-    "check_calendar",
-    "general_question",
-    "confirm_booking",
-    "cancel",
+    "greeting", "search_events", "book_ticket", "check_calendar",
+    "general_question", "confirm_booking", "cancel",
   ];
 
   return validActions.includes(action) ? action : "general_question";
@@ -182,10 +177,7 @@ async function generateResponse(
   ];
 
   if (systemContext) {
-    messages.push({
-      role: "system",
-      content: systemContext,
-    });
+    messages.push({ role: "system", content: systemContext });
   }
 
   const response = await client.chat.completions.create({
@@ -195,7 +187,25 @@ async function generateResponse(
     max_tokens: 1000,
   });
 
-  return response.choices[0]?.message?.content || "I'm here to help you find and book event tickets! What are you looking for?";
+  return response.choices[0]?.message?.content || "I'm here to help you find and book event tickets!";
+}
+
+// --- Check if event name matches user query ---
+
+function findEventByName(events: ScrapedEvent[], query: string): ScrapedEvent | null {
+  const q = query.toLowerCase();
+  // Try exact-ish match first
+  for (const event of events) {
+    if (q.includes(event.name.toLowerCase())) return event;
+    if (event.name.toLowerCase().includes(q)) return event;
+  }
+  // Try partial word match
+  const words = q.split(/\s+/).filter((w) => w.length > 3);
+  for (const event of events) {
+    const eName = event.name.toLowerCase();
+    if (words.some((w) => eName.includes(w))) return event;
+  }
+  return null;
 }
 
 // --- Main Agent Handler ---
@@ -212,75 +222,47 @@ export async function handleMessage(
   const toolCalls: ToolCallResult[] = [];
 
   try {
-    // --- Step 1: Classify what the user wants ---
     const action = await classifyAction(userMessage, state.awaitingConfirmation);
     console.log(`[Agent] Classified action: ${action}`);
 
     switch (action) {
-      // ========================================
-      // GREETING — Just chat back
-      // ========================================
       case "greeting": {
         const response = await generateResponse(userMessage, conversationHistory);
         return { response, toolCalls };
       }
 
-      // ========================================
-      // GENERAL QUESTION — Answer conversationally
-      // ========================================
       case "general_question": {
         const response = await generateResponse(
-          userMessage,
-          conversationHistory,
-          "Answer the user's question helpfully. You are TickClick, an AI ticketing agent that can discover events at KYD-powered venues (Le Poisson Rouge, DJ Mike Nasty), check Google Calendar availability, and book on-chain cNFT tickets on Solana. Explain what you can do if asked."
+          userMessage, conversationHistory,
+          "Answer the user's question helpfully. You are TickClick, an AI ticketing agent that discovers events at KYD-powered venues (Le Poisson Rouge, DJ Mike Nasty), checks Google Calendar availability, and books real on-chain cNFT tickets on Solana devnet. Each booking mints a real compressed NFT."
         );
         return { response, toolCalls };
       }
 
-      // ========================================
-      // CANCEL / RESET
-      // ========================================
       case "cancel": {
         resetAgentState();
-        return {
-          response: "No problem! I've cleared everything. What would you like to do next?",
-          toolCalls: [],
-        };
+        return { response: "No problem! I've cleared everything. What would you like to do next?", toolCalls: [] };
       }
 
-      // ========================================
-      // SEARCH EVENTS — Discover what's available
-      // ========================================
       case "search_events": {
         return await handleEventSearch(userMessage, conversationHistory, toolCalls);
       }
 
-      // ========================================
-      // BOOK TICKET — Full booking flow
-      // ========================================
       case "book_ticket": {
         return await handleBookingRequest(userMessage, conversationHistory, toolCalls);
       }
 
-      // ========================================
-      // CONFIRM BOOKING — User picked an event
-      // ========================================
       case "confirm_booking": {
         if (state.awaitingConfirmation && state.lastPresentedEvents.length > 0) {
           return await handleBookingConfirmation(userMessage, toolCalls);
         }
-        // No events to confirm — treat as search
         return await handleEventSearch(userMessage, conversationHistory, toolCalls);
       }
 
-      // ========================================
-      // CHECK CALENDAR
-      // ========================================
       case "check_calendar": {
         const response = await generateResponse(
-          userMessage,
-          conversationHistory,
-          "The user wants to check calendar availability. Ask them: 1) Who are the attendees (names)? 2) What dates/days are they considering? Once you have this info, you can check their Google Calendars for free slots."
+          userMessage, conversationHistory,
+          "The user wants to check calendar availability. Ask them: 1) Who are the attendees? 2) What dates/days? Once you have this info, you can check their Google Calendars for free slots."
         );
         return { response, toolCalls };
       }
@@ -292,14 +274,11 @@ export async function handleMessage(
     }
   } catch (error: any) {
     console.error("[Agent] Error:", error);
-    return {
-      response: "Sorry, I hit a snag processing that. Could you try rephrasing?",
-      toolCalls,
-    };
+    return { response: "Sorry, I hit a snag processing that. Could you try rephrasing?", toolCalls };
   }
 }
 
-// --- Handle Event Search ---
+// --- Handle Event Search (browse only, no booking) ---
 
 async function handleEventSearch(
   userMessage: string,
@@ -310,69 +289,45 @@ async function handleEventSearch(
   toolCalls: ToolCallResult[];
   events?: EventMatch[];
 }> {
-  // Scrape events
-  toolCalls.push({
-    tool: "discover_events",
-    status: "running",
-    summary: "Scanning KYD-powered venues for events...",
-  });
+  toolCalls.push({ tool: "discover_events", status: "running", summary: "Scanning KYD-powered venues for events..." });
 
   let events: ScrapedEvent[];
-  try {
-    events = await discoverEvents();
-  } catch {
-    events = getStaticEventData();
-  }
+  try { events = await discoverEvents(); }
+  catch { events = getStaticEventData(); }
   state.events = events;
 
   toolCalls[toolCalls.length - 1] = {
-    tool: "discover_events",
-    status: "completed",
+    tool: "discover_events", status: "completed",
     summary: `Found ${events.length} events across KYD venues`,
     data: { count: events.length },
   };
 
-  // Light intent extraction to filter
   const intent = await extractIntent(userMessage);
-
-  // Match events
-  toolCalls.push({
-    tool: "match_events",
-    status: "running",
-    summary: "Finding the best matches...",
-  });
-
   const matches = matchEvents(events, intent, undefined);
   state.matches = matches;
   state.lastPresentedEvents = matches;
 
-  toolCalls[toolCalls.length - 1] = {
-    tool: "match_events",
-    status: "completed",
+  toolCalls.push({
+    tool: "match_events", status: "completed",
     summary: `${matches.length} event(s) match your criteria`,
     data: { matchCount: matches.length },
-  };
+  });
 
-  // Generate conversational response with results
   const matchSummary = formatMatchResults(matches);
   const response = await generateResponse(
-    userMessage,
-    conversationHistory,
-    `Here are the events you found. Present them clearly and conversationally:\n\n${matchSummary}\n\nAfter listing the events, ask if they'd like to book any of them. Number each event so they can say "book #1" etc. If no events matched, let them know and suggest broadening their search.`
+    userMessage, conversationHistory,
+    `Here are the events found. Present them clearly with numbers (#1, #2, etc):\n\n${matchSummary}\n\nAfter listing, ask which they'd like to book. Do NOT fabricate any booking — just list the events.`
   );
 
   if (matches.length > 0) {
     state.awaitingConfirmation = true;
+    state.intent = intent;
   }
 
-  return {
-    response,
-    toolCalls,
-    events: matches,
-  };
+  return { response, toolCalls, events: matches };
 }
 
-// --- Handle Full Booking Request ---
+// --- Handle Booking Request (actually executes real booking!) ---
 
 async function handleBookingRequest(
   userMessage: string,
@@ -385,120 +340,119 @@ async function handleBookingRequest(
   events?: EventMatch[];
 }> {
   // Step 1: Extract intent
-  toolCalls.push({
-    tool: "parse_intent",
-    status: "running",
-    summary: "Understanding your booking request...",
-  });
-
+  toolCalls.push({ tool: "parse_intent", status: "running", summary: "Understanding your booking request..." });
   const intent = await extractIntent(userMessage);
   state.intent = intent;
 
   toolCalls[toolCalls.length - 1] = {
-    tool: "parse_intent",
-    status: "completed",
-    summary: `Looking for ${intent.attendees.length} ticket(s)${
-      intent.budget ? `, under $${intent.budget}` : ""
-    }${intent.preferredDays.length > 0 ? `, ${intent.preferredDays.join("/")}` : ""}${
-      intent.genres.length > 0 ? `, genres: ${intent.genres.join(", ")}` : ""
-    }`,
+    tool: "parse_intent", status: "completed",
+    summary: `Looking for ${intent.attendees.length} ticket(s)${intent.budget ? `, under $${intent.budget}` : ""}`,
     data: intent,
   };
 
   // Step 2: Discover events
-  toolCalls.push({
-    tool: "discover_events",
-    status: "running",
-    summary: "Scanning KYD-powered venues...",
-  });
+  toolCalls.push({ tool: "discover_events", status: "running", summary: "Scanning KYD-powered venues..." });
 
   let events: ScrapedEvent[];
-  try {
-    events = await discoverEvents();
-  } catch {
-    events = getStaticEventData();
-  }
+  try { events = await discoverEvents(); }
+  catch { events = getStaticEventData(); }
   state.events = events;
 
   toolCalls[toolCalls.length - 1] = {
-    tool: "discover_events",
-    status: "completed",
+    tool: "discover_events", status: "completed",
     summary: `Found ${events.length} events across KYD venues`,
     data: { count: events.length },
   };
 
-  // Step 3: Check calendars (if requested and attendees provided)
+  // Step 3: Check calendars (if requested)
   let freeSlots;
   if (intent.checkCalendar && intent.attendees.length > 0) {
     toolCalls.push({
-      tool: "check_calendars",
-      status: "running",
+      tool: "check_calendars", status: "running",
       summary: `Checking availability for ${intent.attendees.map((a) => a.name).join(" & ")}...`,
     });
-
     const attendeeNames = intent.attendees.map((a) => a.name);
     const availability = getMockAvailability(attendeeNames);
     freeSlots = findOverlappingFreeSlots(availability, intent.preferredDays);
-
     toolCalls[toolCalls.length - 1] = {
-      tool: "check_calendars",
-      status: "completed",
+      tool: "check_calendars", status: "completed",
       summary: `Found ${freeSlots.length} overlapping free slots`,
       data: { freeSlotCount: freeSlots.length },
     };
   }
 
   // Step 4: Match events
-  toolCalls.push({
-    tool: "match_events",
-    status: "running",
-    summary: "Finding the best matches...",
-  });
-
+  toolCalls.push({ tool: "match_events", status: "running", summary: "Finding the best matches..." });
   const matches = matchEvents(events, intent, freeSlots);
   state.matches = matches;
   state.lastPresentedEvents = matches;
 
   toolCalls[toolCalls.length - 1] = {
-    tool: "match_events",
-    status: "completed",
+    tool: "match_events", status: "completed",
     summary: `${matches.length} event(s) match your criteria`,
     data: { matchCount: matches.length },
   };
 
-  // Step 5: Present results
-  const matchSummary = formatMatchResults(matches);
+  // Step 5: Try to find the specific event user mentioned
+  const specificEvent = findEventByName(events, userMessage);
 
+  if (specificEvent) {
+    // User named a specific event — BOOK IT NOW
+    console.log(`[Agent] User named specific event: "${specificEvent.name}" — executing real booking!`);
+
+    const attendees = intent.attendees.length > 0 ? intent.attendees : [{ name: "User" }];
+
+    toolCalls.push({
+      tool: "execute_booking", status: "running",
+      summary: `Booking "${specificEvent.name}" for ${attendees.map((a) => a.name).join(" & ")}...`,
+    });
+
+    // *** THIS IS WHERE REAL BOOKING HAPPENS ***
+    let result;
+    if (process.env.MERKLE_TREE_ADDRESS && process.env.USER_WALLET_PUBLIC_KEY) {
+      console.log(`[Agent] MERKLE_TREE_ADDRESS found — calling executeBooking() for REAL minting`);
+      result = await executeBooking({
+        event: specificEvent,
+        attendees,
+        fanWalletAddress: process.env.USER_WALLET_PUBLIC_KEY || "",
+      });
+    } else {
+      console.log(`[Agent] No MERKLE_TREE_ADDRESS — falling back to simulation`);
+      result = simulateBooking(specificEvent, attendees);
+    }
+
+    toolCalls[toolCalls.length - 1] = {
+      tool: "execute_booking",
+      status: result.success ? "completed" : "error",
+      summary: result.success
+        ? `Booked ${result.tickets.length} ticket(s) on Solana!`
+        : `Booking failed: ${result.error}`,
+      data: result,
+    };
+
+    const response = formatBookingResult(result);
+    state.awaitingConfirmation = false;
+
+    return { response, toolCalls, tickets: result.tickets };
+  }
+
+  // No specific event found — present options and wait for selection
+  const matchSummary = formatMatchResults(matches);
   const attendeeNames = intent.attendees.map((a) => a.name).join(" & ");
-  const contextInfo = [
-    `Attendees: ${attendeeNames || "not specified"}`,
-    intent.budget ? `Budget: under $${intent.budget}` : null,
-    intent.preferredDays.length > 0 ? `Preferred days: ${intent.preferredDays.join(", ")}` : null,
-    intent.genres.length > 0 ? `Genres: ${intent.genres.join(", ")}` : null,
-    intent.checkCalendar ? `Calendar checked: yes` : null,
-    freeSlots ? `Free slots found: ${freeSlots.length}` : null,
-  ]
-    .filter(Boolean)
-    .join("\n");
 
   const response = await generateResponse(
-    userMessage,
-    conversationHistory,
-    `You extracted this booking intent:\n${contextInfo}\n\nHere are the matching events:\n${matchSummary}\n\nPresent the results clearly. Number each event (#1, #2, etc). Include all details: name, date, time, venue, price. Mention the attendees by name. Ask which event they'd like to book. If no matches, explain why and suggest alternatives.`
+    userMessage, conversationHistory,
+    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\nPresent results with numbers (#1, #2, etc). Include all details. Ask which event to book. Do NOT pretend to have booked anything — you must wait for the user to choose.`
   );
 
   if (matches.length > 0) {
     state.awaitingConfirmation = true;
   }
 
-  return {
-    response,
-    toolCalls,
-    events: matches,
-  };
+  return { response, toolCalls, events: matches };
 }
 
-// --- Handle Booking Confirmation ---
+// --- Handle Booking Confirmation (#1, #2, yes, etc.) ---
 
 async function handleBookingConfirmation(
   userMessage: string,
@@ -509,19 +463,11 @@ async function handleBookingConfirmation(
   tickets?: any[];
 }> {
   const message = userMessage.toLowerCase();
-
-  // Determine which event the user selected
   let selectedIndex = -1;
 
-  if (
-    message.includes("#1") ||
-    message.includes("first") ||
-    message === "1" ||
-    message.includes("yes") ||
-    message.includes("book it") ||
-    message.includes("go ahead") ||
-    message.includes("confirm")
-  ) {
+  if (message.includes("#1") || message.includes("first") || message === "1" ||
+      message.includes("yes") || message.includes("book it") || message.includes("go ahead") ||
+      message.includes("confirm")) {
     selectedIndex = 0;
   } else if (message.includes("#2") || message === "2" || message.includes("second")) {
     selectedIndex = 1;
@@ -535,7 +481,7 @@ async function handleBookingConfirmation(
 
   if (selectedIndex < 0 || selectedIndex >= state.lastPresentedEvents.length) {
     return {
-      response: `I have ${state.lastPresentedEvents.length} event(s) listed. Which one would you like to book? You can say "book #1", "book #2", etc.`,
+      response: `I have ${state.lastPresentedEvents.length} event(s) listed. Which one would you like to book? Say "book #1", "book #2", etc.`,
       toolCalls: [],
     };
   }
@@ -544,24 +490,22 @@ async function handleBookingConfirmation(
   const event = selectedMatch.event;
   const attendees = state.intent?.attendees || [{ name: "User" }];
 
-  // Execute booking
   toolCalls.push({
-    tool: "execute_booking",
-    status: "running",
+    tool: "execute_booking", status: "running",
     summary: `Booking "${event.name}" for ${attendees.map((a) => a.name).join(" & ")}...`,
   });
 
+  // *** REAL BOOKING ***
   let result;
-  const isLiveMode =
-    process.env.FAN_WALLET_SECRET_KEY && process.env.MERKLE_TREE_ADDRESS;
-
-  if (isLiveMode) {
+  if (process.env.MERKLE_TREE_ADDRESS && process.env.USER_WALLET_PUBLIC_KEY) {
+    console.log(`[Agent] Confirmation booking — calling executeBooking() for REAL minting`);
     result = await executeBooking({
       event,
       attendees,
-      fanWalletAddress: "",
+      fanWalletAddress: process.env.USER_WALLET_PUBLIC_KEY || "",
     });
   } else {
+    console.log(`[Agent] No MERKLE_TREE_ADDRESS — falling back to simulation`);
     result = simulateBooking(event, attendees);
   }
 
@@ -575,18 +519,12 @@ async function handleBookingConfirmation(
   };
 
   const response = formatBookingResult(result);
-
-  // Reset confirmation state (but keep events cached)
   state.awaitingConfirmation = false;
 
-  return {
-    response,
-    toolCalls,
-    tickets: result.tickets,
-  };
+  return { response, toolCalls, tickets: result.tickets };
 }
 
-// --- Reset Agent State ---
+// --- Reset ---
 
 export function resetAgentState() {
   state.events = [];
