@@ -1,6 +1,7 @@
 // =============================================
 // TixAgent — Chat API Route
 // POST /api/agent — handles user messages
+// Now passes userWallet for Phantom integration
 // =============================================
 
 import { NextRequest, NextResponse } from "next/server";
@@ -10,7 +11,7 @@ import { ChatMessage } from "@/types";
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { message, history = [] } = body;
+    const { message, history = [], userWallet } = body;
 
     if (!message || typeof message !== "string") {
       return NextResponse.json(
@@ -36,14 +37,20 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Process message through agent
-    const result = await handleMessage(message, conversationHistory);
+    // Process message through agent (pass userWallet if connected)
+    const result = await handleMessage(
+      message,
+      conversationHistory,
+      userWallet || undefined
+    );
 
     return NextResponse.json({
       response: result.response,
       toolCalls: result.toolCalls,
       tickets: result.tickets || [],
       events: result.events || [],
+      walletAction: result.walletAction || null,
+      pendingBooking: result.pendingBooking || null,
     });
   } catch (error: any) {
     console.error("Agent API error:", error);
