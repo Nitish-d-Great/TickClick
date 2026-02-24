@@ -33,8 +33,8 @@ export async function sendBookingEmail(payload: EmailPayload): Promise<{ success
   const html = buildEmailHtml({
     eventName: event.name,
     venueName: event.venue,
-    eventDate: `${event.dayOfWeek || ""} ${event.date}`.trim(),
-    eventTime: event.time,
+    eventDate: [event.dayOfWeek, event.date].filter(Boolean).join(", ") || "TBA",
+    eventTime: event.time || "",
     eventPrice: event.isFree ? "Free" : `$${event.price}`,
     tickets,
     merkleTreeAddress,
@@ -171,7 +171,7 @@ function buildEmailHtml(data: EmailData): string {
           </tr>
           <tr>
             <td style="padding: 6px 0; color: #666;">Date & Time</td>
-            <td style="padding: 6px 0; font-weight: 500;">${data.eventDate} at ${data.eventTime}</td>
+            <td style="padding: 6px 0; font-weight: 500;">${data.eventDate || "TBA"}${data.eventTime ? " at " + data.eventTime : ""}</td>
           </tr>
           <tr>
             <td style="padding: 6px 0; color: #666;">Price</td>

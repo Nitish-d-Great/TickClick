@@ -344,7 +344,12 @@ async function handleEventSearch(
   };
 
   const intent = await extractIntent(userMessage);
-  const matches = matchEvents(events, intent, undefined);
+  let matches = matchEvents(events, intent, undefined);
+  // If no matches, show all events so the LLM never invents fake ones
+  if (matches.length === 0) {
+    matches = events.map((e, i) => ({ event: e, score: 50, rank: i + 1, reasons: ["Showing all available events"] }));
+    console.log(`[Agent] No matches from filter — showing all ${events.length} events`);
+  }
   state.matches = matches;
   state.lastPresentedEvents = matches;
 
@@ -357,7 +362,7 @@ async function handleEventSearch(
   const matchSummary = formatMatchResults(matches);
   const response = await generateResponse(
     userMessage, conversationHistory,
-    `Here are the events found. Present them clearly with numbers (#1, #2, etc):\n\n${matchSummary}\n\nAfter listing, ask which they'd like to book. Do NOT fabricate any booking — just list the events.`
+    `Here are the REAL events found from KYD venues:\n\n${matchSummary}\n\nIMPORTANT RULES:\n- ONLY show events from the list above. NEVER invent or make up events.\n- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n- Do NOT fabricate event names, prices, dates, or venues.\n- Number each real event (#1, #2, etc) and ask which to book.`
   );
 
   if (matches.length > 0) {
@@ -424,7 +429,11 @@ async function handleBookingRequest(
 
   // Step 4: Match events
   toolCalls.push({ tool: "match_events", status: "running", summary: "Finding the best matches..." });
-  const matches = matchEvents(events, intent, freeSlots);
+  let matches = matchEvents(events, intent, freeSlots);
+  if (matches.length === 0) {
+    matches = events.map((e, i) => ({ event: e, score: 50, rank: i + 1, reasons: ["Showing all available events"] }));
+    console.log(`[Agent] No matches from filter — showing all ${events.length} events`);
+  }
   state.matches = matches;
   state.lastPresentedEvents = matches;
 

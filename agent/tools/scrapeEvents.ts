@@ -307,11 +307,49 @@ export function getStaticEventData(): ScrapedEvent[] {
 export async function discoverEvents(): Promise<ScrapedEvent[]> {
   try {
     const events = await scrapeAllVenues();
-    if (events.length > 0) return events;
+    if (events.length > 0) return enrichEventDates(events);
     console.log("⚠️ No events found via scraping, using static fallback data");
     return getStaticEventData();
   } catch (error) {
     console.error("⚠️ Scraping failed, using static fallback data:", error);
     return getStaticEventData();
   }
+}
+
+/**
+ * Post-process scraped events to extract dates from description text.
+ * KYD descriptions contain dates like: "Event NameWed Feb 25 6:30PMLe Poisson Rouge..."
+ */
+function enrichEventDates(events: ScrapedEvent[]): ScrapedEvent[] {
+  return events.map((event) => {
+    // Skip if date already parsed
+    if (event.dayOfWeek && event.time) return event;
+
+    const desc = event.description || "";
+
+    // Match patterns like "Wed Feb 25 6:30PM" or "Thu Feb 26 7:00PM"
+    const dateMatch = desc.match(
+      /(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{1,2}:\d{2})\s*(AM|PM)/i
+    );
+
+    if (dateMatch) {
+      const [, day, month, dateNum, time, ampm] = dateMatch;
+      event.dayOfWeek = day;
+      event.date = `${month} ${dateNum}`;
+      event.time = `${time} ${ampm}`;
+    } else {
+      // Try without AM/PM (KYD often uses "6:30PM" with no space)
+      const altMatch = desc.match(
+        /(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+(\d{1,2}:\d{2})(AM|PM)/i
+      );
+      if (altMatch) {
+        const [, day, month, dateNum, time, ampm] = altMatch;
+        event.dayOfWeek = day;
+        event.date = `${month} ${dateNum}`;
+        event.time = `${time}${ampm}`;
+      }
+    }
+
+    return event;
+  });
 }

@@ -20,6 +20,25 @@ import {
   Attendee,
 } from "@/types";
 
+function extractDateFromEvent(event: ScrapedEvent): string {
+  if (event.date && event.dayOfWeek && event.time) return `${event.dayOfWeek}, ${event.date}  at ${event.time}`;
+  if (event.dayOfWeek && event.time) return `${event.dayOfWeek}, ${event.time}`;
+  if (event.dayOfWeek) return event.dayOfWeek;
+  if (event.date && event.time) return `${event.date} at ${event.time}`;
+  
+  
+  // Parse from description (format: "...Event NameWed Feb 25 6:30PMVenue...")
+  const desc = event.description || "";
+  const dateMatch = desc.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{1,2}:\d{2}\s*(AM|PM)/i);
+  if (dateMatch) return dateMatch[0];
+  
+  // Try without time
+  const dateOnly = desc.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}/i);
+  if (dateOnly) return dateOnly[0];
+  
+  return "TBA";
+}
+
 // Booking fee per ticket in SOL (devnet)
 const BOOKING_FEE_SOL = 0.001;
 
@@ -82,6 +101,7 @@ export async function executeBooking(
     const tickets: TicketInfo[] = [];
 
     // Mint a real cNFT for each attendee
+    console.log("[DEBUG] Event fields:", JSON.stringify(event, null, 2));
     for (let i = 0; i < attendees.length; i++) {
       const attendee = attendees[i];
 
@@ -94,7 +114,7 @@ export async function executeBooking(
         symbol: "TICK",
         uri: "",
         eventName: event.name,
-        eventDate: event.date,
+        eventDate: extractDateFromEvent(event),
         venue: event.venue,
         attendeeName: attendee.name,
         pricePaid: event.price,
@@ -115,7 +135,7 @@ export async function executeBooking(
         cnftAssetId: result.assetId,
         mintTxHash: result.mintTxHash,
         eventName: event.name,
-        eventDate: event.date,
+        eventDate: extractDateFromEvent(event),
         venue: event.venue,
         pricePaid: event.price,
         status: TicketStatus.Active,
@@ -167,10 +187,7 @@ export function formatBookingResult(result: BookingResult): string {
 
   msg += `**Event:** ${result.event.name}\n`;
   msg += `**Venue:** ${result.event.venue}\n`;
-  const dateStr = result.event.dayOfWeek
-    ? `${result.event.dayOfWeek}, ${result.event.date}`
-    : result.event.date;
-  msg += `**Date:** ${dateStr} at ${result.event.time}\n`;
+  msg += `**Date:** ${extractDateFromEvent(result.event)}\n`;
   msg += `**Total:** ${result.event.isFree ? "FREE" : `$${result.totalPaid}`}\n`;
 
   if (isReal) {
@@ -222,7 +239,7 @@ export function simulateBooking(
     cnftAssetId: `DemoAsset_${attendee.name.replace(/\s/g, "_")}_${Date.now()}_${i}`,
     mintTxHash: mockTxHash,
     eventName: event.name,
-    eventDate: event.date,
+    eventDate: extractDateFromEvent(event),
     venue: event.venue,
     pricePaid: event.price,
     status: TicketStatus.Active,
