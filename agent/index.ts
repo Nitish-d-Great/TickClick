@@ -2,6 +2,7 @@
 // TickClick — Conversational AI Ticket Agent
 // Uses LLM to decide actions dynamically
 // Executes REAL Solana transactions when configured
+// Sends booking confirmation emails via Resend
 // =============================================
 
 import OpenAI from "openai";
@@ -17,6 +18,7 @@ import {
   simulateBooking,
   formatBookingResult,
 } from "./tools/executeBooking";
+import { sendBookingEmail } from "@/lib/email";
 import {
   ChatMessage,
   UserIntent,
@@ -24,6 +26,7 @@ import {
   EventMatch,
   ToolCallResult,
   Attendee,
+  BookingResult,
 } from "@/types";
 
 // --- Agent State ---
@@ -34,6 +37,9 @@ interface AgentState {
   intent: UserIntent | null;
   awaitingConfirmation: boolean;
   lastPresentedEvents: EventMatch[];
+  // Email flow
+  awaitingEmail: boolean;
+  lastBookingResult: BookingResult | null;
 }
 
 const state: AgentState = {
@@ -42,6 +48,8 @@ const state: AgentState = {
   intent: null,
   awaitingConfirmation: false,
   lastPresentedEvents: [],
+  awaitingEmail: false,
+  lastBookingResult: null,
 };
 
 // --- Groq Client (OpenAI-compatible) ---
@@ -68,12 +76,29 @@ type UserAction =
   | "check_calendar"
   | "general_question"
   | "confirm_booking"
+  | "provide_email"
   | "cancel";
 
 async function classifyAction(
   userMessage: string,
-  isAwaitingConfirmation: boolean
+  isAwaitingConfirmation: boolean,
+  isAwaitingEmail: boolean
 ): Promise<UserAction> {
+  // Quick check: if awaiting email and message looks like an email
+  if (isAwaitingEmail) {
+    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+    if (emailRegex.test(userMessage)) {
+      return "provide_email";
+    }
+    // If they say "no" or "skip", treat as cancel
+    const lower = userMessage.toLowerCase();
+    if (lower.includes("no") || lower.includes("skip") || lower.includes("later")) {
+      state.awaitingEmail = false;
+      state.lastBookingResult = null;
+      return "general_question";
+    }
+  }
+
   const client = getLLMClient();
 
   const response = await client.chat.completions.create({
@@ -86,11 +111,13 @@ async function classifyAction(
 - "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available
 - "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions booking, names, specific events)
 - "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second)
+- "provide_email" — user is providing an email address
 - "check_calendar" — user specifically asks about calendar availability
 - "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
 - "cancel" — user wants to cancel, start over, or reset
 
-${isAwaitingConfirmation ? "IMPORTANT: The agent just showed event options and is waiting for the user to pick one. If the user seems to be selecting or confirming, classify as 'confirm_booking'. If they're asking something new, classify appropriately." : ""}`,
+${isAwaitingConfirmation ? "IMPORTANT: The agent just showed event options. If the user is selecting or confirming, classify as 'confirm_booking'." : ""}
+${isAwaitingEmail ? "IMPORTANT: The agent just asked for an email. If the message contains an email address, classify as 'provide_email'." : ""}`,
       },
       { role: "user", content: userMessage },
     ],
@@ -105,7 +132,7 @@ ${isAwaitingConfirmation ? "IMPORTANT: The agent just showed event options and i
 
   const validActions: UserAction[] = [
     "greeting", "search_events", "book_ticket", "check_calendar",
-    "general_question", "confirm_booking", "cancel",
+    "general_question", "confirm_booking", "provide_email", "cancel",
   ];
 
   return validActions.includes(action) ? action : "general_question";
@@ -190,22 +217,28 @@ async function generateResponse(
   return response.choices[0]?.message?.content || "I'm here to help you find and book event tickets!";
 }
 
-// --- Check if event name matches user query ---
+// --- Find event by name ---
 
 function findEventByName(events: ScrapedEvent[], query: string): ScrapedEvent | null {
   const q = query.toLowerCase();
-  // Try exact-ish match first
   for (const event of events) {
     if (q.includes(event.name.toLowerCase())) return event;
     if (event.name.toLowerCase().includes(q)) return event;
   }
-  // Try partial word match
   const words = q.split(/\s+/).filter((w) => w.length > 3);
   for (const event of events) {
     const eName = event.name.toLowerCase();
     if (words.some((w) => eName.includes(w))) return event;
   }
   return null;
+}
+
+// --- Extract email from message ---
+
+function extractEmail(message: string): string | null {
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+  const match = message.match(emailRegex);
+  return match ? match[0] : null;
 }
 
 // --- Main Agent Handler ---
@@ -222,7 +255,11 @@ export async function handleMessage(
   const toolCalls: ToolCallResult[] = [];
 
   try {
-    const action = await classifyAction(userMessage, state.awaitingConfirmation);
+    const action = await classifyAction(
+      userMessage,
+      state.awaitingConfirmation,
+      state.awaitingEmail
+    );
     console.log(`[Agent] Classified action: ${action}`);
 
     switch (action) {
@@ -234,7 +271,7 @@ export async function handleMessage(
       case "general_question": {
         const response = await generateResponse(
           userMessage, conversationHistory,
-          "Answer the user's question helpfully. You are TickClick, an AI ticketing agent that discovers events at KYD-powered venues (Le Poisson Rouge, DJ Mike Nasty), checks Google Calendar availability, and books real on-chain cNFT tickets on Solana devnet. Each booking mints a real compressed NFT."
+          "Answer the user's question helpfully. You are TickClick, an AI ticketing agent that discovers events at KYD-powered venues (Le Poisson Rouge, DJ Mike Nasty), checks Google Calendar availability, and books real on-chain cNFT tickets on Solana devnet. Each booking mints a real compressed NFT and you can email booking confirmations."
         );
         return { response, toolCalls };
       }
@@ -259,6 +296,10 @@ export async function handleMessage(
         return await handleEventSearch(userMessage, conversationHistory, toolCalls);
       }
 
+      case "provide_email": {
+        return await handleEmailSend(userMessage, toolCalls);
+      }
+
       case "check_calendar": {
         const response = await generateResponse(
           userMessage, conversationHistory,
@@ -278,7 +319,7 @@ export async function handleMessage(
   }
 }
 
-// --- Handle Event Search (browse only, no booking) ---
+// --- Handle Event Search ---
 
 async function handleEventSearch(
   userMessage: string,
@@ -327,7 +368,7 @@ async function handleEventSearch(
   return { response, toolCalls, events: matches };
 }
 
-// --- Handle Booking Request (actually executes real booking!) ---
+// --- Handle Booking Request ---
 
 async function handleBookingRequest(
   userMessage: string,
@@ -397,52 +438,17 @@ async function handleBookingRequest(
   const specificEvent = findEventByName(events, userMessage);
 
   if (specificEvent) {
-    // User named a specific event — BOOK IT NOW
     console.log(`[Agent] User named specific event: "${specificEvent.name}" — executing real booking!`);
-
-    const attendees = intent.attendees.length > 0 ? intent.attendees : [{ name: "User" }];
-
-    toolCalls.push({
-      tool: "execute_booking", status: "running",
-      summary: `Booking "${specificEvent.name}" for ${attendees.map((a) => a.name).join(" & ")}...`,
-    });
-
-    // *** THIS IS WHERE REAL BOOKING HAPPENS ***
-    let result;
-    if (process.env.MERKLE_TREE_ADDRESS && process.env.USER_WALLET_PUBLIC_KEY) {
-      console.log(`[Agent] MERKLE_TREE_ADDRESS found — calling executeBooking() for REAL minting`);
-      result = await executeBooking({
-        event: specificEvent,
-        attendees,
-        fanWalletAddress: process.env.USER_WALLET_PUBLIC_KEY || "",
-      });
-    } else {
-      console.log(`[Agent] No MERKLE_TREE_ADDRESS — falling back to simulation`);
-      result = simulateBooking(specificEvent, attendees);
-    }
-
-    toolCalls[toolCalls.length - 1] = {
-      tool: "execute_booking",
-      status: result.success ? "completed" : "error",
-      summary: result.success
-        ? `Booked ${result.tickets.length} ticket(s) on Solana!`
-        : `Booking failed: ${result.error}`,
-      data: result,
-    };
-
-    const response = formatBookingResult(result);
-    state.awaitingConfirmation = false;
-
-    return { response, toolCalls, tickets: result.tickets };
+    return await executeAndRespond(specificEvent, intent.attendees, toolCalls);
   }
 
-  // No specific event found — present options and wait for selection
+  // No specific event found — present options
   const matchSummary = formatMatchResults(matches);
   const attendeeNames = intent.attendees.map((a) => a.name).join(" & ");
 
   const response = await generateResponse(
-    userMessage, conversationHistory,
-    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\nPresent results with numbers (#1, #2, etc). Include all details. Ask which event to book. Do NOT pretend to have booked anything — you must wait for the user to choose.`
+    userMessage, [],
+    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\nPresent results with numbers (#1, #2, etc). Include all details. Ask which event to book. Do NOT pretend to have booked anything.`
   );
 
   if (matches.length > 0) {
@@ -452,7 +458,62 @@ async function handleBookingRequest(
   return { response, toolCalls, events: matches };
 }
 
-// --- Handle Booking Confirmation (#1, #2, yes, etc.) ---
+// --- Execute Booking and Build Response (shared by both flows) ---
+
+async function executeAndRespond(
+  event: ScrapedEvent,
+  attendees: Attendee[],
+  toolCalls: ToolCallResult[]
+): Promise<{
+  response: string;
+  toolCalls: ToolCallResult[];
+  tickets?: any[];
+}> {
+  if (attendees.length === 0) attendees = [{ name: "User" }];
+
+  toolCalls.push({
+    tool: "execute_booking", status: "running",
+    summary: `Booking "${event.name}" for ${attendees.map((a) => a.name).join(" & ")}...`,
+  });
+
+  let result;
+  if (process.env.MERKLE_TREE_ADDRESS && process.env.USER_WALLET_PUBLIC_KEY) {
+    console.log(`[Agent] MERKLE_TREE_ADDRESS found — calling executeBooking() for REAL minting`);
+    result = await executeBooking({
+      event,
+      attendees,
+      fanWalletAddress: process.env.USER_WALLET_PUBLIC_KEY || "",
+    });
+  } else {
+    console.log(`[Agent] No MERKLE_TREE_ADDRESS — falling back to simulation`);
+    result = simulateBooking(event, attendees);
+  }
+
+  toolCalls[toolCalls.length - 1] = {
+    tool: "execute_booking",
+    status: result.success ? "completed" : "error",
+    summary: result.success
+      ? `Booked ${result.tickets.length} ticket(s) on Solana!`
+      : `Booking failed: ${result.error}`,
+    data: result,
+  };
+
+  // Build booking response
+  let response = formatBookingResult(result);
+
+  // Store result for email and prompt user
+  if (result.success) {
+    state.lastBookingResult = result;
+    state.awaitingEmail = true;
+    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
+  }
+
+  state.awaitingConfirmation = false;
+
+  return { response, toolCalls, tickets: result.tickets };
+}
+
+// --- Handle Booking Confirmation ---
 
 async function handleBookingConfirmation(
   userMessage: string,
@@ -481,47 +542,82 @@ async function handleBookingConfirmation(
 
   if (selectedIndex < 0 || selectedIndex >= state.lastPresentedEvents.length) {
     return {
-      response: `I have ${state.lastPresentedEvents.length} event(s) listed. Which one would you like to book? Say "book #1", "book #2", etc.`,
+      response: `I have ${state.lastPresentedEvents.length} event(s) listed. Which one? Say "book #1", "book #2", etc.`,
       toolCalls: [],
     };
   }
 
   const selectedMatch = state.lastPresentedEvents[selectedIndex];
-  const event = selectedMatch.event;
   const attendees = state.intent?.attendees || [{ name: "User" }];
 
-  toolCalls.push({
-    tool: "execute_booking", status: "running",
-    summary: `Booking "${event.name}" for ${attendees.map((a) => a.name).join(" & ")}...`,
-  });
+  return await executeAndRespond(selectedMatch.event, attendees, toolCalls);
+}
 
-  // *** REAL BOOKING ***
-  let result;
-  if (process.env.MERKLE_TREE_ADDRESS && process.env.USER_WALLET_PUBLIC_KEY) {
-    console.log(`[Agent] Confirmation booking — calling executeBooking() for REAL minting`);
-    result = await executeBooking({
-      event,
-      attendees,
-      fanWalletAddress: process.env.USER_WALLET_PUBLIC_KEY || "",
-    });
-  } else {
-    console.log(`[Agent] No MERKLE_TREE_ADDRESS — falling back to simulation`);
-    result = simulateBooking(event, attendees);
+// --- Handle Email Send ---
+
+async function handleEmailSend(
+  userMessage: string,
+  toolCalls: ToolCallResult[]
+): Promise<{
+  response: string;
+  toolCalls: ToolCallResult[];
+}> {
+  const email = extractEmail(userMessage);
+
+  if (!email) {
+    return {
+      response: "I couldn't find a valid email address in your message. Could you share your email? (e.g., name@gmail.com)",
+      toolCalls: [],
+    };
   }
 
-  toolCalls[toolCalls.length - 1] = {
-    tool: "execute_booking",
-    status: result.success ? "completed" : "error",
-    summary: result.success
-      ? `Booked ${result.tickets.length} ticket(s) on Solana!`
-      : `Booking failed: ${result.error}`,
-    data: result,
-  };
+  if (!state.lastBookingResult) {
+    return {
+      response: "I don't have a recent booking to email. Book some tickets first, then I'll send the confirmation!",
+      toolCalls: [],
+    };
+  }
 
-  const response = formatBookingResult(result);
-  state.awaitingConfirmation = false;
+  console.log(`[Agent] Sending booking confirmation to: ${email}`);
 
-  return { response, toolCalls, tickets: result.tickets };
+  toolCalls.push({
+    tool: "send_email", status: "running",
+    summary: `Sending booking confirmation to ${email}...`,
+  });
+
+  const emailResult = await sendBookingEmail({
+    to: email,
+    bookingResult: state.lastBookingResult,
+    merkleTreeAddress: process.env.MERKLE_TREE_ADDRESS || "Not configured",
+    userWalletAddress: process.env.USER_WALLET_PUBLIC_KEY || "Not configured",
+    venueWalletAddress: process.env.VENUE_WALLET_PUBLIC_KEY || "AMowwS1iaoKZMMwJxWY5jdeCKukbm64XyZEg8fwbXCPw",
+  });
+
+  if (emailResult.success) {
+    toolCalls[toolCalls.length - 1] = {
+      tool: "send_email", status: "completed",
+      summary: `Booking confirmation sent to ${email}!`,
+    };
+
+    // Clear email state
+    state.awaitingEmail = false;
+    state.lastBookingResult = null;
+
+    return {
+      response: `📧 **Booking confirmation sent to ${email}!**\n\nThe email includes all your ticket details, transaction hashes, wallet addresses, and Solana Explorer links. Check your inbox (and spam folder just in case).\n\nAnything else I can help with?`,
+      toolCalls,
+    };
+  } else {
+    toolCalls[toolCalls.length - 1] = {
+      tool: "send_email", status: "error",
+      summary: `Failed to send email: ${emailResult.error}`,
+    };
+
+    return {
+      response: `❌ Sorry, I couldn't send the email: ${emailResult.error}\n\nYou can try again with a different email, or I can help you with something else.`,
+      toolCalls,
+    };
+  }
 }
 
 // --- Reset ---
@@ -532,4 +628,6 @@ export function resetAgentState() {
   state.intent = null;
   state.awaitingConfirmation = false;
   state.lastPresentedEvents = [];
+  state.awaitingEmail = false;
+  state.lastBookingResult = null;
 }
