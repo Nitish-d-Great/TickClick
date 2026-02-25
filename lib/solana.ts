@@ -98,33 +98,14 @@ export async function transferSol(
 // --- Build Metadata URI ---
 
 /**
- * Build a dynamic metadata URI pointing to our /api/ticket-metadata endpoint.
- * This serves Metaplex-standard JSON with the event poster image.
- * 
- * IMPORTANT: Bubblegum URI max is ~200 chars. We use the app's own base URL
- * so the metadata is always resolvable. For production, use Arweave/IPFS.
+ * Returns the publicly accessible metadata URI for cNFT tickets.
+ * Points to a static JSON hosted on GitHub (raw.githubusercontent.com)
+ * so that Phantom and other wallets/explorers can resolve the metadata + image.
+ *
+ * IMPORTANT: Bubblegum URI max is ~200 chars. This URL is well under that limit.
  */
-function buildMetadataUri(metadata: CnftMetadata): string {
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.VERCEL_URL
-    ? `https://${process.env.VERCEL_URL}`
-    : "http://localhost:3000";
-
-  // Encode minimal params to stay under 200 chars
-  const params = new URLSearchParams({
-    e: (metadata.eventName || "Event").slice(0, 30),
-    a: (metadata.attendeeName || "Attendee").slice(0, 15),
-    v: (metadata.venue || "Venue").slice(0, 20),
-  });
-
-  const uri = `${baseUrl}/api/ticket-metadata?${params.toString()}`;
-
-  // Bubblegum enforces ~200 char limit on URI
-  if (uri.length > 200) {
-    // Fallback to a short static URI if too long
-    return `${baseUrl}/api/ticket-metadata?e=Event&a=Guest`;
-  }
-
-  return uri;
+function buildMetadataUri(): string {
+  return "https://raw.githubusercontent.com/Nitish-d-Great/tickclick-metadata/main/ticket.json";
 }
 
 // --- Resolve Event Image ---
@@ -134,17 +115,8 @@ function resolveEventImage(metadata: CnftMetadata): string {
   // 1. Use explicit event image if provided (e.g., from KYD scraper)
   if (metadata.eventImage) return metadata.eventImage;
 
-  // 2. Fallback to venue-specific poster images
-  const venueLower = (metadata.venue || "").toLowerCase();
-  if (venueLower.includes("poisson rouge") || venueLower.includes("lpr")) {
-    return "https://images.unsplash.com/photo-1501386761578-0a55d8f28b23?w=600&q=80";
-  }
-  if (venueLower.includes("mike nasty") || venueLower.includes("djmikenasty")) {
-    return "https://images.unsplash.com/photo-1571266028243-3716f02d2d58?w=600&q=80";
-  }
-
-  // 3. Generic concert/event image
-  return "https://images.unsplash.com/photo-1540039155733-5bb30b53aa14?w=600&q=80";
+  // 2. Use the same image from our GitHub-hosted metadata
+  return "https://raw.githubusercontent.com/Nitish-d-Great/tickclick-metadata/main/ticket-image.svg";
 }
 
 // --- cNFT Minting via Bubblegum (real on-chain) ---
@@ -167,8 +139,8 @@ export async function mintCnftTicket(
   const umiKeypair = fromWeb3JsKeypair(treeAuthorityKeypair);
   umi.use(keypairIdentity(umiKeypair));
 
-  // Build dynamic metadata URI
-  const metadataUri = buildMetadataUri(metadata);
+  // Public metadata URI (GitHub-hosted, resolvable by Phantom/explorers)
+  const metadataUri = buildMetadataUri();
   const eventImage = resolveEventImage(metadata);
 
   // Bubblegum max name is 32 chars. Strip "(Sold Out)" and truncate.
