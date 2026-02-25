@@ -38,6 +38,9 @@ Or start simple:
   const [isLoading, setIsLoading] = useState(false);
   const [activeToolCalls, setActiveToolCalls] = useState<any[]>([]);
 
+  // Store last booking result for email flow
+  const [lastBookingResult, setLastBookingResult] = useState<any>(null);
+
   // Phantom wallet state
   const {
     connected,
@@ -61,7 +64,6 @@ Or start simple:
         setPlatformTxHash(sig);
         setAccessPaid(true);
 
-        // Add system message about successful payment
         const paymentMsg: Message = {
           id: crypto.randomUUID(),
           role: "assistant",
@@ -95,22 +97,25 @@ Or start simple:
       let signature: string | null = null;
 
       if (walletAction.type === "sign_message" && walletAction.message) {
-        // Free ticket: sign confirmation message
         setIsLoading(true);
+        setActiveToolCalls((prev) => [...prev, { tool: "phantom_wallet", status: "running", summary: "Requesting message signature..." }]);
         signature = await signMessage(walletAction.message);
         if (!signature) throw new Error("Signature cancelled");
+        setActiveToolCalls((prev) => prev.map((tc) => tc.tool === "phantom_wallet" ? { ...tc, status: "completed", summary: "Message signed ✓" } : tc));
       } else if (
         walletAction.type === "transfer_sol" &&
         walletAction.amount &&
         walletAction.recipient
       ) {
-        // Paid ticket: send SOL
         setIsLoading(true);
+        setActiveToolCalls((prev) => [...prev, { tool: "phantom_wallet", status: "running", summary: `Requesting ${walletAction.amount} SOL payment...` }]);
         txHash = await sendSol(walletAction.amount, walletAction.recipient);
         if (!txHash) throw new Error("Transaction cancelled");
+        setActiveToolCalls((prev) => prev.map((tc) => tc.tool === "phantom_wallet" ? { ...tc, status: "completed", summary: `Payment of ${walletAction.amount} SOL confirmed ✓` } : tc));
       }
 
-      // Execute the booking on server
+      setActiveToolCalls((prev) => [...prev, { tool: "mint_cnft", status: "running", summary: "Minting cNFT ticket on Solana..." }]);
+
       const response = await fetch("/api/agent/execute-booking", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -123,15 +128,27 @@ Or start simple:
         }),
       });
 
-      const data = await response.json();
+      const bookingData = await response.json();
+
+      // Update minting tool call status
+      setActiveToolCalls((prev) =>
+        prev.map((tc) =>
+          tc.tool === "mint_cnft" ? { ...tc, status: "completed", summary: "cNFT ticket minted ✓" } : tc
+        )
+      );
+
+      // Store booking result for email flow
+      if (bookingData.bookingResult) {
+        setLastBookingResult(bookingData.bookingResult);
+      }
 
       const bookingMsg: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: data.response,
+        content: bookingData.response,
         timestamp: new Date(),
-        toolCalls: data.toolCalls,
-        tickets: data.tickets,
+        toolCalls: bookingData.toolCalls,
+        tickets: bookingData.tickets,
       };
       setMessages((prev) => [...prev, bookingMsg]);
     } catch (err: any) {
@@ -173,7 +190,9 @@ Or start simple:
             role: m.role,
             content: m.content,
           })),
-          userWallet: publicKey, // Send connected wallet address
+          userWallet: publicKey,
+          // Send stored booking result so server can use it for email
+          bookingResult: lastBookingResult,
         }),
       });
 
@@ -187,9 +206,13 @@ Or start simple:
         }
       }
 
+      // Store booking result if server returns one (after successful booking)
+      if (data.bookingResult) {
+        setLastBookingResult(data.bookingResult);
+      }
+
       // Check if agent wants a wallet action (booking confirmation)
       if (data.walletAction && data.pendingBooking) {
-        // Show the agent's message first
         const promptMsg: Message = {
           id: crypto.randomUUID(),
           role: "assistant",
@@ -199,14 +222,12 @@ Or start simple:
         };
         setMessages((prev) => [...prev, promptMsg]);
         setIsLoading(false);
-        setActiveToolCalls([]);
 
-        // Trigger wallet action (Phantom popup)
         await handleWalletAction(data.walletAction, data.pendingBooking);
         return;
       }
 
-      // Normal response (no wallet action needed)
+      // Normal response
       const assistantMessage: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
@@ -228,7 +249,6 @@ Or start simple:
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
-      setActiveToolCalls([]);
     }
   };
 

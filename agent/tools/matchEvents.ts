@@ -59,45 +59,114 @@ function parseEventDate(dateStr: string, timeStr?: string): Date | null {
 }
 
 /**
- * Get start (Monday 00:00) and end (Sunday 23:59) of the current week.
+ * Detect what time range the user wants and return start/end dates.
+ * Returns null if no time constraint detected.
  */
-function getCurrentWeekRange(): { start: Date; end: Date } {
-  const now = new Date();
-  const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon, ...
-  const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
-
-  const start = new Date(now);
-  start.setDate(now.getDate() + diffToMonday);
-  start.setHours(0, 0, 0, 0);
-
-  const end = new Date(start);
-  end.setDate(start.getDate() + 6);
-  end.setHours(23, 59, 59, 999);
-
-  return { start, end };
-}
-
-/**
- * Check if user intent implies a "this week" time constraint.
- */
-function intentImpliesThisWeek(intent: UserIntent): boolean {
+function detectTimeRange(intent: UserIntent): { start: Date; end: Date } | null {
   const notes = (intent.additionalNotes || "").toLowerCase();
   const days = intent.preferredDays.map((d) => d.toLowerCase());
 
-  // Check for explicit week references
-  if (notes.includes("this week") || notes.includes("week")) return true;
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
 
-  // If user specified weekend days, assume this week
-  if (
-    days.includes("weekend") ||
-    days.includes("this weekend") ||
-    days.includes("saturday") ||
-    days.includes("sunday")
-  ) {
-    return true;
+  // "next 10 days" / "within 5 days" / "next 3 days" / "in the next 14 days"
+  const nDaysMatch = notes.match(/(?:next|within|in)\s+(\d+)\s*days/i);
+  if (nDaysMatch) {
+    const numDays = parseInt(nDaysMatch[1]);
+    const end = new Date(now);
+    end.setDate(now.getDate() + numDays);
+    end.setHours(23, 59, 59, 999);
+    return { start: now, end };
   }
 
-  return false;
+  const dayOfWeek = now.getDay(); // 0=Sun, 1=Mon
+  const diffToMonday = dayOfWeek === 0 ? -6 : 1 - dayOfWeek;
+
+  const thisMonday = new Date(now);
+  thisMonday.setDate(now.getDate() + diffToMonday);
+  thisMonday.setHours(0, 0, 0, 0);
+
+  const thisSunday = new Date(thisMonday);
+  thisSunday.setDate(thisMonday.getDate() + 6);
+  thisSunday.setHours(23, 59, 59, 999);
+
+  const nextSunday = new Date(thisMonday);
+  nextSunday.setDate(thisMonday.getDate() + 13);
+  nextSunday.setHours(23, 59, 59, 999);
+
+  // "next two weeks" / "two weeks" / "2 weeks" / "next 2 weeks"
+  if (notes.match(/(?:next\s+)?(?:two|2)\s+weeks/) || notes.includes("couple of weeks")) {
+    return { start: now, end: nextSunday };
+  }
+
+  // "this week and next week" / "this and next week" / "this week as well as next week"
+  if (
+    (notes.includes("this week") && notes.includes("next week")) ||
+    (notes.includes("this week") && notes.includes("next")) ||
+    notes.includes("both weeks")
+  ) {
+    return { start: thisMonday, end: nextSunday };
+  }
+
+  // "next week" only (not "this week")
+  if (notes.includes("next week") && !notes.includes("this week")) {
+    const nextMonday = new Date(thisMonday);
+    nextMonday.setDate(thisMonday.getDate() + 7);
+    const nextWeekSunday = new Date(nextMonday);
+    nextWeekSunday.setDate(nextMonday.getDate() + 6);
+    nextWeekSunday.setHours(23, 59, 59, 999);
+    return { start: nextMonday, end: nextWeekSunday };
+  }
+
+  // "this week" only
+  if (notes.includes("this week")) {
+    return { start: thisMonday, end: thisSunday };
+  }
+
+  // "this month"
+  if (notes.includes("this month")) {
+    const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+    return { start: now, end: endOfMonth };
+  }
+
+  // "this weekend" or weekend preference → this week's Sat-Sun
+  if (
+    days.includes("weekend") || days.includes("this weekend") ||
+    notes.includes("this weekend") || notes.includes("weekend")
+  ) {
+    const saturday = new Date(thisMonday);
+    saturday.setDate(thisMonday.getDate() + 5);
+    saturday.setHours(0, 0, 0, 0);
+    return { start: saturday, end: thisSunday };
+  }
+
+  // "today" / "tonight"
+  if (notes.includes("today") || notes.includes("tonight")) {
+    const endOfDay = new Date(now);
+    endOfDay.setHours(23, 59, 59, 999);
+    return { start: now, end: endOfDay };
+  }
+
+  // "tomorrow"
+  if (notes.includes("tomorrow")) {
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    tomorrow.setHours(0, 0, 0, 0);
+    const endTomorrow = new Date(tomorrow);
+    endTomorrow.setHours(23, 59, 59, 999);
+    return { start: tomorrow, end: endTomorrow };
+  }
+
+  // Generic "week" mention without specifics → assume next 7 days
+  if (notes.includes("week")) {
+    const sevenDays = new Date(now);
+    sevenDays.setDate(now.getDate() + 7);
+    sevenDays.setHours(23, 59, 59, 999);
+    return { start: now, end: sevenDays };
+  }
+
+  // No time constraint detected
+  return null;
 }
 
 /**
@@ -110,15 +179,14 @@ export function matchEvents(
   freeSlots?: OverlappingSlot[]
 ): EventMatch[] {
   let matches: EventMatch[] = [];
-  const thisWeek = intentImpliesThisWeek(intent);
-  const weekRange = thisWeek ? getCurrentWeekRange() : null;
+  const timeRange = detectTimeRange(intent);
 
   for (const event of events) {
     const { score, reasons, calendarMatch, matchingSlot } = scoreEvent(
       event,
       intent,
       freeSlots,
-      weekRange
+      timeRange
     );
 
     // Only include events with a positive score
@@ -136,8 +204,8 @@ export function matchEvents(
   // Sort by score descending
   matches.sort((a, b) => b.score - a.score);
 
-  // Return top 10 matches (increased from 5 to allow "show all this week")
-  return matches.slice(0, 10);
+  // Return top 15 matches
+  return matches.slice(0, 15);
 }
 
 /**
@@ -147,7 +215,7 @@ function scoreEvent(
   event: ScrapedEvent,
   intent: UserIntent,
   freeSlots?: OverlappingSlot[],
-  weekRange?: { start: Date; end: Date } | null
+  timeRange?: { start: Date; end: Date } | null
 ): {
   score: number;
   reasons: string[];
@@ -169,15 +237,15 @@ function scoreEvent(
     return { score: 0, reasons: ["Event already passed"], calendarMatch: false };
   }
 
-  // --- "This week" filter (hard) ---
-  if (weekRange && eventDate) {
-    if (eventDate < weekRange.start || eventDate > weekRange.end) {
-      return { score: 0, reasons: ["Outside requested week"], calendarMatch: false };
+  // --- "Time range" filter (hard) ---
+  if (timeRange && eventDate) {
+    if (eventDate < timeRange.start || eventDate > timeRange.end) {
+      return { score: 0, reasons: ["Outside requested time range"], calendarMatch: false };
     }
     score += 15;
-    reasons.push("📆 This week");
-  } else if (weekRange && !eventDate) {
-    // If we need this week but can't parse the date, exclude
+    reasons.push("📆 Within requested dates");
+  } else if (timeRange && !eventDate) {
+    // If we need a time range but can't parse the date, exclude
     return { score: 0, reasons: ["Could not determine event date"], calendarMatch: false };
   }
 
@@ -209,9 +277,18 @@ function scoreEvent(
   }
 
   // --- Paid event filter ---
-  // If user specifically asks for paid events
-  if ((notes.includes("paid") || notes.includes("ticketed")) && event.isFree) {
-    return { score: 0, reasons: ["Free event — user wants paid"], calendarMatch: false };
+  // If user specifically asks for paid events, exclude only confirmed free events
+  // (Don't exclude events where price fetch may have failed — price=0 with no explicit "free" marker)
+  if ((notes.includes("paid") || notes.includes("ticketed")) && event.isFree && event.price === 0) {
+    // Only exclude if the event was explicitly marked free (not just default 0)
+    // Events that failed price fetch will have price=0 but may actually be paid
+    // Check if description mentions "free" or "RSVP" without cover
+    const desc = (event.description || "").toLowerCase();
+    if (desc.includes("free") || desc.includes("no cover") || desc.includes("no charge")) {
+      return { score: 0, reasons: ["Free event — user wants paid"], calendarMatch: false };
+    }
+    // Otherwise, keep it — might be paid but price fetch failed
+    score += 5;
   }
 
   // --- Day Preference ---

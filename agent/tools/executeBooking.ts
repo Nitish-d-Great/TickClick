@@ -202,7 +202,7 @@ export function formatBookingResult(result: BookingResult): string {
 
     if (isReal) {
       msg += `- cNFT ID: \`${ticket.cnftAssetId}\`\n`;
-      msg += `- Mint Tx: \`${ticket.mintTxHash.slice(0, 20)}...\`\n`;
+      msg += `- Mint Tx: [\`${ticket.mintTxHash.slice(0, 20)}...\`](https://explorer.solana.com/tx/${ticket.mintTxHash}?cluster=devnet)\n`;
       msg += `- ✅ [Verify on Solana Explorer](${ticket.explorerUrl})\n`;
     } else {
       msg += `- Asset ID: \`${ticket.cnftAssetId}\`\n`;

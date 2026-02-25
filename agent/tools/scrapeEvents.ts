@@ -376,7 +376,7 @@ async function enrichEventPrices(events: ScrapedEvent[]): Promise<ScrapedEvent[]
       try {
         // Normalize ticket URL — KYD redirects to kydlabs.com/e/...
         let url = event.ticketUrl;
-        if (!url || url === event.venueUrl) return event;
+        if (!url) return event;
 
         // Ensure full URL
         if (url.startsWith("/")) {
@@ -388,7 +388,7 @@ async function enrichEventPrices(events: ScrapedEvent[]): Promise<ScrapedEvent[]
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
           },
           redirect: "follow",
-          signal: AbortSignal.timeout(8000), // 8s timeout per event
+          signal: AbortSignal.timeout(15000), // 15s timeout per event
         });
 
         if (!response.ok) return event;
@@ -427,20 +427,73 @@ async function enrichEventPrices(events: ScrapedEvent[]): Promise<ScrapedEvent[]
 
 /**
  * Parse ticket price from KYD event detail page HTML.
+ * KYD pages may be client-rendered, so we check:
+ *   1. Embedded JSON/__NEXT_DATA__/initial state (most reliable)
+ *   2. HTML text patterns (for server-rendered content)
  */
 function extractPriceFromHtml(
   html: string,
   eventName: string
 ): { price: number; type: string } {
-  // Pattern 1: All-in price like "$38.89" or "$25.00"
-  // KYD uses "All-In price" text near the price
+
+  // === Strategy 1: Extract from embedded JSON/script data ===
+  // KYD pages often embed event data in script tags or __NEXT_DATA__
+  try {
+    // Look for __NEXT_DATA__ (Next.js pages)
+    const nextDataMatch = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (nextDataMatch) {
+      const jsonStr = nextDataMatch[1];
+      // Look for price-related fields in the JSON
+      const pricePatterns = [
+        /"price"\s*:\s*([\d.]+)/,
+        /"amount"\s*:\s*([\d.]+)/,
+        /"cost"\s*:\s*([\d.]+)/,
+        /"ticketPrice"\s*:\s*([\d.]+)/,
+      ];
+      for (const pattern of pricePatterns) {
+        const match = jsonStr.match(pattern);
+        if (match && parseFloat(match[1]) > 0) {
+          return { price: parseFloat(match[1]), type: "json_data" };
+        }
+      }
+      // Check for "free" in JSON
+      if (/"isFree"\s*:\s*true/i.test(jsonStr)) {
+        return { price: 0, type: "free" };
+      }
+    }
+
+    // Look for any script tag containing price/ticket data
+    const scriptBlocks = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
+    for (const block of scriptBlocks) {
+      // Check for cover charge in script content
+      const coverInScript = block.match(/[Cc]over\s*(?:is\s*)?\$\s*([\d]+(?:\.[\d]{2})?)/);
+      if (coverInScript) {
+        return { price: parseFloat(coverInScript[1]), type: "cover_charge" };
+      }
+      // Check for RSVP with price in script
+      const rsvpPrice = block.match(/RSVP[^"]*\$\s*([\d]+(?:\.[\d]{2})?)/i);
+      if (rsvpPrice) {
+        return { price: parseFloat(rsvpPrice[1]), type: "cover_charge" };
+      }
+      // Check for ticket price objects in JSON
+      const ticketObj = block.match(/"ticket[^"]*"[^{]*\{[^}]*"price"\s*:\s*([\d.]+)/i);
+      if (ticketObj && parseFloat(ticketObj[1]) > 0) {
+        return { price: parseFloat(ticketObj[1]), type: "json_ticket" };
+      }
+    }
+  } catch (e) {
+    // JSON parsing failed, continue to HTML patterns
+  }
+
+  // === Strategy 2: HTML text patterns ===
+
+  // Pattern 1: All-in price like "$38.89 All-In"
   const allInMatch = html.match(/\$([\d]+(?:\.[\d]{2})?)\s*(?:<[^>]*>)*\s*All-In/i);
   if (allInMatch) {
     return { price: parseFloat(allInMatch[1]), type: "all_in" };
   }
 
-  // Pattern 2: Price in ticket table — look for dollar amounts near ticket type names
-  // Match "$XX.XX" that appears in ticket pricing context
+  // Pattern 2: Price in ticket table
   const ticketPriceMatch = html.match(
     /(?:GA|General|Standing|Advance|VIP|Table|Premium)[^$]*\$([\d]+(?:\.[\d]{2})?)/i
   );
@@ -448,14 +501,26 @@ function extractPriceFromHtml(
     return { price: parseFloat(ticketPriceMatch[1]), type: "ticket_table" };
   }
 
-  // Pattern 3: RSVP with cover charge — "Cover is $10 before..."
-  const coverMatch = html.match(/Cover\s+is\s+\$([\d]+(?:\.[\d]{2})?)/i);
+  // Pattern 3: Cover charge — multiple formats
+  // "Cover is $10 before...", "Cover $10", "$10 cover", "Cover: $10"
+  const coverMatch = html.match(/[Cc]over\s*(?:is\s*|:\s*)?\$\s*([\d]+(?:\.[\d]{2})?)/);
   if (coverMatch) {
     return { price: parseFloat(coverMatch[1]), type: "cover_charge" };
   }
+  const coverMatch2 = html.match(/\$([\d]+(?:\.[\d]{2})?)\s*(?:cover|at the door)/i);
+  if (coverMatch2) {
+    return { price: parseFloat(coverMatch2[1]), type: "cover_charge" };
+  }
 
-  // Pattern 4: Any dollar amount in the ticket section
-  // Look for prices between "Get Your Tickets" / "Register" and the end of that section
+  // Pattern 4: RSVP text alongside a dollar amount — likely a cover charge
+  if (/RSVP/i.test(html)) {
+    const rsvpDollar = html.match(/\$([\d]+(?:\.[\d]{2})?)/);
+    if (rsvpDollar && parseFloat(rsvpDollar[1]) > 0 && parseFloat(rsvpDollar[1]) < 200) {
+      return { price: parseFloat(rsvpDollar[1]), type: "cover_charge" };
+    }
+  }
+
+  // Pattern 5: Any dollar amount in ticket section
   const ticketSectionMatch = html.match(
     /(?:Get Your Tickets|Register|Ticket Type)[^]*?\$([\d]+(?:\.[\d]{2})?)/i
   );
@@ -466,22 +531,26 @@ function extractPriceFromHtml(
     }
   }
 
-  // Pattern 5: Sold out detection
+  // Pattern 6: Sold out detection
   if (
     /Sold\s*Out/i.test(html) &&
-    !html.match(/\$([\d]+(?:\.[\d]{2})?)/) // No visible price
+    !html.match(/\$([\d]+(?:\.[\d]{2})?)/)
   ) {
     return { price: 0, type: "sold_out" };
   }
 
-  // Pattern 6: RSVP with no price at all — truly free or cover at door
-  if (/RSVP\s*Now/i.test(html) && !/\$[\d]/.test(html)) {
+  // Pattern 7: RSVP / Register with NO dollar sign anywhere — truly free
+  if (/(?:RSVP\s*Now|Register)/i.test(html) && !/\$[\d]/.test(html)) {
     return { price: 0, type: "free" };
   }
 
-  // Pattern 7: "Register" page with no dollar signs
-  if (/Register/i.test(html) && !/\$[\d]/.test(html)) {
-    return { price: 0, type: "free" };
+  // Pattern 8: Last resort — any dollar amount on the page
+  const anyPrice = html.match(/\$([\d]+(?:\.[\d]{2})?)/);
+  if (anyPrice) {
+    const price = parseFloat(anyPrice[1]);
+    if (price > 0 && price < 500) {
+      return { price, type: "fallback_price" };
+    }
   }
 
   return { price: 0, type: "unknown" };

@@ -73,10 +73,19 @@ const LLM_MODEL = "llama-3.3-70b-versatile";
 type UserAction = "greeting" | "search_events" | "book_ticket" | "check_calendar" | "general_question" | "confirm_booking" | "provide_email" | "cancel";
 
 async function classifyAction(userMessage: string, isAwaitingConfirmation: boolean, isAwaitingEmail: boolean): Promise<UserAction> {
+  // Quick check: email in message while awaiting email OR even without awaiting
+  // (in case state was lost due to hot reload)
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
+  const hasEmail = emailRegex.test(userMessage);
+  const lower = userMessage.toLowerCase();
+  
+  // If message has an email and mentions sending/emailing, always treat as provide_email
+  if (hasEmail && (lower.includes("email") || lower.includes("send") || lower.includes("mail") || isAwaitingEmail)) {
+    return "provide_email";
+  }
+
   if (isAwaitingEmail) {
-    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
-    if (emailRegex.test(userMessage)) return "provide_email";
-    const lower = userMessage.toLowerCase();
+    if (hasEmail) return "provide_email";
     if (lower.includes("no") || lower.includes("skip") || lower.includes("later")) {
       state.awaitingEmail = false;
       state.lastBookingResult = null;
@@ -95,7 +104,7 @@ async function classifyAction(userMessage: string, isAwaitingConfirmation: boole
 - "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available
 - "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions booking, names, specific events)
 - "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second)
-- "provide_email" — user is providing an email address
+- "provide_email" — user is providing an email address or asking to send/email booking confirmation
 - "check_calendar" — user specifically asks about calendar availability
 - "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
 - "cancel" — user wants to cancel, start over, or reset
@@ -186,7 +195,8 @@ function extractEmail(message: string): string | null {
 export async function handleMessage(
   userMessage: string,
   conversationHistory: ChatMessage[],
-  userWallet?: string
+  userWallet?: string,
+  clientBookingResult?: BookingResult
 ): Promise<{
   response: string;
   toolCalls: ToolCallResult[];
@@ -194,8 +204,16 @@ export async function handleMessage(
   events?: EventMatch[];
   walletAction?: any;
   pendingBooking?: any;
+  bookingResult?: BookingResult | null;
 }> {
   const toolCalls: ToolCallResult[] = [];
+
+  // Restore booking result from client if server state was lost (hot reload)
+  if (clientBookingResult && !state.lastBookingResult) {
+    console.log("[Agent] Restoring booking result from client state");
+    state.lastBookingResult = clientBookingResult;
+    state.awaitingEmail = true;
+  }
 
   try {
     const action = await classifyAction(userMessage, state.awaitingConfirmation, state.awaitingEmail);
@@ -269,7 +287,7 @@ async function handleEventSearch(userMessage: string, conversationHistory: ChatM
 
   const matchSummary = formatMatchResults(matches);
   const response = await generateResponse(userMessage, conversationHistory,
-    `Here are the REAL events found from KYD venues:\n\n${matchSummary}\n\nIMPORTANT RULES:\n- ONLY show events from the list above. NEVER invent or make up events.\n- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n- Do NOT fabricate event names, prices, dates, or venues.\n- Number each real event (#1, #2, etc) and ask which to book.`
+    `Here are the REAL events found from KYD venues:\n\n${matchSummary}\n\nIMPORTANT RULES:\n- ONLY show events from the list above. NEVER invent or make up events.\n- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n- Do NOT fabricate event names, prices, dates, or venues.\n- The prices shown are REAL prices scraped from the venue websites. TRUST THEM. Do NOT override or change any price. If an event shows $10, it costs $10 — it is NOT free.\n- Do NOT claim any event is free unless the data explicitly shows "$0" or "FREE".\n- List EVERY event from the data — do not skip any. Number each (#1, #2, etc) and ask which to book.`
   );
 
   if (matches.length > 0) { state.awaitingConfirmation = true; state.intent = intent; }
@@ -318,7 +336,7 @@ async function handleBookingRequest(userMessage: string, conversationHistory: Ch
   const matchSummary = formatMatchResults(matches);
   const attendeeNames = intent.attendees.map((a) => a.name).join(" & ");
   const response = await generateResponse(userMessage, [],
-    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\nPresent results with numbers (#1, #2, etc). Include all details. Ask which event to book. Do NOT pretend to have booked anything.`
+    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\nPresent ALL results with numbers (#1, #2, etc). Include all details. The prices shown are REAL and accurate — TRUST THEM. If an event shows $10, it costs $10, it is NOT free. Do NOT skip any events. Ask which event to book. Do NOT pretend to have booked anything.`
   );
   if (matches.length > 0) state.awaitingConfirmation = true;
   return { response, toolCalls, events: matches };
@@ -328,10 +346,10 @@ async function handleBookingRequest(userMessage: string, conversationHistory: Ch
 
 async function executeAndRespond(
   event: ScrapedEvent, attendees: Attendee[], toolCalls: ToolCallResult[], userWallet?: string
-): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any }> {
+): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any; bookingResult?: BookingResult | null }> {
   if (attendees.length === 0) attendees = [{ name: "User" }];
 
-  // ── NEW: Phantom wallet connected → require wallet confirmation ──
+  // ── Phantom wallet connected → require wallet confirmation ──
   if (userWallet) {
     const isFree = event.isFree || event.price === 0;
 
@@ -373,7 +391,7 @@ async function executeAndRespond(
     }
   }
 
-  // ── ORIGINAL: No wallet → auto-execute (venue pays) ──
+  // ── No wallet → auto-execute (venue pays) ──
   toolCalls.push({ tool: "execute_booking", status: "running", summary: `Booking "${event.name}" for ${attendees.map((a) => a.name).join(" & ")}...` });
 
   let result;
@@ -399,7 +417,9 @@ async function executeAndRespond(
     response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
   }
   state.awaitingConfirmation = false;
-  return { response, toolCalls, tickets: result.tickets };
+
+  // Return bookingResult to frontend so it can send it back for email
+  return { response, toolCalls, tickets: result.tickets, bookingResult: result.success ? result : null };
 }
 
 // --- Handle Booking Confirmation ---
@@ -428,7 +448,12 @@ async function handleBookingConfirmation(userMessage: string, toolCalls: ToolCal
 async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[]) {
   const email = extractEmail(userMessage);
   if (!email) return { response: "I couldn't find a valid email address in your message. Could you share your email? (e.g., name@gmail.com)", toolCalls: [] };
-  if (!state.lastBookingResult) return { response: "I don't have a recent booking to email. Book some tickets first, then I'll send the confirmation!", toolCalls: [] };
+  
+  // Use server state or restored client state
+  if (!state.lastBookingResult) {
+    console.log("[Agent] No booking result in server state — email cannot be sent");
+    return { response: "I don't have a recent booking to email. Book some tickets first, then I'll send the confirmation!", toolCalls: [] };
+  }
 
   console.log(`[Agent] Sending booking confirmation to: ${email}`);
   toolCalls.push({ tool: "send_email", status: "running", summary: `Sending booking confirmation to ${email}...` });
@@ -456,7 +481,7 @@ async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[])
 
 export async function executePendingBooking(
   event: ScrapedEvent, attendees: Attendee[], userWallet: string, paymentTxHash?: string
-): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[] }> {
+): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; bookingResult?: BookingResult | null }> {
   const toolCalls: ToolCallResult[] = [];
 
   console.log(`\n[Agent] Executing pending booking after wallet confirmation`);
@@ -489,7 +514,9 @@ export async function executePendingBooking(
     state.awaitingEmail = true;
     response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
   }
-  return { response, toolCalls, tickets: result.tickets };
+
+  // Return bookingResult to frontend
+  return { response, toolCalls, tickets: result.tickets, bookingResult: result.success ? result : null };
 }
 
 // --- Reset ---
