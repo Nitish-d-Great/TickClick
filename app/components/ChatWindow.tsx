@@ -2,7 +2,7 @@
 
 import { useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import { TicketCard } from "./TicketCard";
+import { TicketCardGrid } from "./TicketCard";
 
 interface Message {
   id: string;
@@ -95,20 +95,20 @@ export function ChatWindow({ messages, isLoading }: ChatWindowProps) {
                 </div>
               )}
 
-              {/* Ticket cards */}
+              {/* Visual NFT Ticket Cards */}
               {msg.tickets && msg.tickets.length > 0 && (
-                <div className="mt-4 space-y-3">
-                  {msg.tickets.map((ticket: any, i: number) => (
-                    <TicketCard key={i} ticket={ticket} />
-                  ))}
-                </div>
+                <TicketCardGrid tickets={msg.tickets} />
               )}
 
               {/* Timestamp */}
               <div className="mt-2 text-right">
-              <span suppressHydrationWarning>
-  {new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true })}
-</span>
+                <span suppressHydrationWarning>
+                  {new Date().toLocaleTimeString("en-US", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    hour12: true,
+                  })}
+                </span>
               </div>
             </div>
           </div>

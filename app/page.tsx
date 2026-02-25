@@ -27,7 +27,7 @@ export default function Home() {
 Tell me what you're looking for and I'll find the perfect show, check everyone's calendars, and book on-chain tickets for you.
 
 **Try saying something like:**
-> "Book 2 tickets for me and my friend Akash. Check our calendars. Under $50, prefer weekends, we like jazz."
+> "Book 2 tickets for me (abc@email.com) and my friend Akash (xyz@email.com). Check our calendars. Under $50, prefer weekends."
 
 Or start simple:
 > "What events are available this weekend?"`,
@@ -62,65 +62,76 @@ Or start simple:
   const [accessPaid, setAccessPaid] = useState(false);
   const [platformTxHash, setPlatformTxHash] = useState<string | null>(null);
 
-  // Parse Google OAuth callback from URL hash on mount
+  // Restore accessPaid + handle OAuth callback on mount
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    const hash = window.location.hash;
-    if (hash.includes("calendar_token=")) {
-      const params = new URLSearchParams(hash.replace("#", ""));
-      const token = params.get("calendar_token");
-      const email = params.get("calendar_email");
-      const expires = params.get("calendar_expires");
-
-      if (token) {
-        setCalendarToken(token);
-        setCalendarEmail(email ? decodeURIComponent(email) : null);
-        setCalendarExpires(expires ? parseInt(expires) : null);
-
-        // Add the primary user's email to attendee list
-        if (email) {
-          setAttendeeEmails((prev) => {
-            const decoded = decodeURIComponent(email);
-            return prev.includes(decoded) ? prev : [...prev, decoded];
-          });
-        }
-
-        console.log(`[Calendar] Connected: ${email}`);
-
-        // Clean up URL hash
-        window.history.replaceState(null, "", window.location.pathname);
-
-        // Show calendar connected message
-        const calMsg: Message = {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: `📅 **Google Calendar connected!** (${email ? decodeURIComponent(email) : "connected"})\n\nI'll now check your calendar before booking to make sure you're free. If you're booking for others, include their email addresses so I can check their calendars too.\n\n*Example: "Book 2 tickets for me and akash@gmail.com for Emo Night Brooklyn"*`,
-          timestamp: new Date(),
-          toolCalls: [
-            {
-              tool: "google_calendar",
-              status: "completed",
-              summary: `Google Calendar connected: ${email ? decodeURIComponent(email) : "connected"}`,
-            },
-          ],
-        };
-        setMessages((prev) => [...prev, calMsg]);
-      }
+    // 1. Restore accessPaid from sessionStorage (survives OAuth redirect)
+    const paid = sessionStorage.getItem("tickclick_access_paid");
+    if (paid === "true") {
+      setAccessPaid(true);
     }
 
-    // Check for calendar error
-    const urlParams = new URLSearchParams(window.location.search);
-    const calError = urlParams.get("calendar_error");
-    if (calError) {
-      const errorMsg: Message = {
+    // 2. Handle Google Calendar OAuth callback or errors
+    const hash = window.location.hash;
+
+    if (!hash.includes("calendar_token=")) {
+      // Plain page load / refresh — check for calendar error in query params only
+      const urlParams = new URLSearchParams(window.location.search);
+      const calError = urlParams.get("calendar_error");
+      if (calError) {
+        const errorMsg: Message = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `❌ Google Calendar connection failed: ${calError}. You can try again or continue without calendar integration.`,
+          timestamp: new Date(),
+        };
+        setMessages((prev) => [...prev, errorMsg]);
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+      // Do NOT auto-connect calendar on refresh
+      return;
+    }
+
+    // This is an OAuth callback — parse the token
+    const params = new URLSearchParams(hash.replace("#", ""));
+    const token = params.get("calendar_token");
+    const email = params.get("calendar_email");
+    const expires = params.get("calendar_expires");
+
+    if (token) {
+      setCalendarToken(token);
+      setCalendarEmail(email ? decodeURIComponent(email) : null);
+      setCalendarExpires(expires ? parseInt(expires) : null);
+
+      // Add the primary user's email to attendee list
+      if (email) {
+        setAttendeeEmails((prev) => {
+          const decoded = decodeURIComponent(email);
+          return prev.includes(decoded) ? prev : [...prev, decoded];
+        });
+      }
+
+      console.log(`[Calendar] Connected: ${email}`);
+
+      // Clean up URL hash immediately so refresh won't re-trigger
+      window.history.replaceState(null, "", window.location.pathname);
+
+      // Show calendar connected message
+      const calMsg: Message = {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: `❌ Google Calendar connection failed: ${calError}. You can try again or continue without calendar integration.`,
+        content: `📅 **Google Calendar connected!** (${email ? decodeURIComponent(email) : "connected"})\n\nI'll now check your calendar before booking to make sure you're free. If you're booking for others, include their email addresses so I can check their calendars too.\n\n*Example: "Book 2 tickets for me and akash@gmail.com for Emo Night Brooklyn"*`,
         timestamp: new Date(),
+        toolCalls: [
+          {
+            tool: "google_calendar",
+            status: "completed",
+            summary: `Google Calendar connected: ${email ? decodeURIComponent(email) : "connected"}`,
+          },
+        ],
       };
-      setMessages((prev) => [...prev, errorMsg]);
-      window.history.replaceState(null, "", window.location.pathname);
+      setMessages((prev) => [...prev, calMsg]);
     }
   }, []);
 
@@ -150,6 +161,7 @@ Or start simple:
       if (sig) {
         setPlatformTxHash(sig);
         setAccessPaid(true);
+        sessionStorage.setItem("tickclick_access_paid", "true"); // Persist across OAuth redirect
 
         const paymentMsg: Message = {
           id: crypto.randomUUID(),
@@ -358,6 +370,7 @@ Or start simple:
         calendarConnected={isCalendarConnected}
         calendarEmail={calendarEmail}
         onCalendarConnect={handleCalendarConnect}
+        showCalendar={accessPaid}
       />
 
       <div className="flex flex-1 overflow-hidden">

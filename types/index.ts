@@ -96,6 +96,8 @@ export interface TicketInfo {
   pricePaid: number;
   status: TicketStatus;
   explorerUrl: string;
+  metadataUri?: string;   
+  eventImage?: string;
 }
 
 export enum TicketStatus {

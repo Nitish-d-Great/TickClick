@@ -9,12 +9,14 @@ interface HeaderProps {
   calendarConnected?: boolean;
   calendarEmail?: string | null;
   onCalendarConnect?: () => void;
+  showCalendar?: boolean;
 }
 
 export function Header({
   calendarConnected = false,
   calendarEmail = null,
   onCalendarConnect,
+  showCalendar = false,
 }: HeaderProps) {
   return (
     <header className="flex items-center justify-between px-6 py-3 border-b border-dark-600 bg-dark-800/50 backdrop-blur-sm">
@@ -33,8 +35,8 @@ export function Header({
 
       {/* Right: Status badges */}
       <div className="flex items-center gap-3">
-        {/* Google Calendar Button */}
-        {onCalendarConnect && (
+        {/* Google Calendar Button — only visible after platform fee is paid */}
+        {showCalendar && onCalendarConnect && (
           calendarConnected ? (
             <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-green-500/10 border border-green-500/30">
               <span className="text-xs">📅</span>

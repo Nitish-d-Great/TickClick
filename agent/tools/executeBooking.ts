@@ -21,21 +21,20 @@ import {
 } from "@/types";
 
 function extractDateFromEvent(event: ScrapedEvent): string {
-  if (event.date && event.dayOfWeek && event.time) return `${event.dayOfWeek}, ${event.date}  at ${event.time}`;
+  if (event.date && event.dayOfWeek && event.time) return `${event.dayOfWeek}, ${event.date} at ${event.time}`;
   if (event.dayOfWeek && event.time) return `${event.dayOfWeek}, ${event.time}`;
   if (event.dayOfWeek) return event.dayOfWeek;
   if (event.date && event.time) return `${event.date} at ${event.time}`;
-  
-  
+
   // Parse from description (format: "...Event NameWed Feb 25 6:30PMVenue...")
   const desc = event.description || "";
   const dateMatch = desc.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{1,2}:\d{2}\s*(AM|PM)/i);
   if (dateMatch) return dateMatch[0];
-  
+
   // Try without time
   const dateOnly = desc.match(/(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}/i);
   if (dateOnly) return dateOnly[0];
-  
+
   return "TBA";
 }
 
@@ -118,6 +117,7 @@ export async function executeBooking(
         venue: event.venue,
         attendeeName: attendee.name,
         pricePaid: event.price,
+        eventImage: event.imageUrl || undefined, // Pass event poster if scraped
       };
 
       const result = await purchaseAndMintTicket(
@@ -140,6 +140,8 @@ export async function executeBooking(
         pricePaid: event.price,
         status: TicketStatus.Active,
         explorerUrl: explorerUrl,
+        metadataUri: result.metadataUri,
+        eventImage: result.eventImage,
       });
 
       console.log(`   ✅ REAL ticket minted for ${attendee.name}`);
@@ -244,6 +246,8 @@ export function simulateBooking(
     pricePaid: event.price,
     status: TicketStatus.Active,
     explorerUrl: `https://explorer.solana.com/tx/${mockTxHash}?cluster=devnet`,
+    metadataUri: "",
+    eventImage: event.imageUrl || "",
   }));
 
   return {
