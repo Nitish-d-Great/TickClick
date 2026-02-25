@@ -1,7 +1,7 @@
 // =============================================
 // TixAgent — Chat API Route
 // POST /api/agent — handles user messages
-// Now passes userWallet and bookingResult
+// Passes userWallet, bookingResult, calendarToken, attendeeEmails
 // =============================================
 
 import { NextRequest, NextResponse } from "next/server";
@@ -11,7 +11,14 @@ import { ChatMessage } from "@/types";
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { message, history = [], userWallet, bookingResult: clientBookingResult } = body;
+    const {
+      message,
+      history = [],
+      userWallet,
+      bookingResult: clientBookingResult,
+      calendarToken,
+      attendeeEmails,
+    } = body;
 
     if (!message || typeof message !== "string") {
       return NextResponse.json(
@@ -42,7 +49,9 @@ export async function POST(request: NextRequest) {
       message,
       conversationHistory,
       userWallet || undefined,
-      clientBookingResult || undefined
+      clientBookingResult || undefined,
+      calendarToken || undefined,
+      attendeeEmails || undefined
     );
 
     return NextResponse.json({
@@ -53,6 +62,7 @@ export async function POST(request: NextRequest) {
       walletAction: result.walletAction || null,
       pendingBooking: result.pendingBooking || null,
       bookingResult: result.bookingResult || null,
+      needsEmails: result.needsEmails || false,
     });
   } catch (error: any) {
     console.error("Agent API error:", error);

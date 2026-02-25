@@ -41,6 +41,12 @@ Or start simple:
   // Store last booking result for email flow
   const [lastBookingResult, setLastBookingResult] = useState<any>(null);
 
+  // Google Calendar state
+  const [calendarToken, setCalendarToken] = useState<string | null>(null);
+  const [calendarEmail, setCalendarEmail] = useState<string | null>(null);
+  const [calendarExpires, setCalendarExpires] = useState<number | null>(null);
+  const [attendeeEmails, setAttendeeEmails] = useState<string[]>([]);
+
   // Phantom wallet state
   const {
     connected,
@@ -55,6 +61,87 @@ Or start simple:
 
   const [accessPaid, setAccessPaid] = useState(false);
   const [platformTxHash, setPlatformTxHash] = useState<string | null>(null);
+
+  // Parse Google OAuth callback from URL hash on mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const hash = window.location.hash;
+    if (hash.includes("calendar_token=")) {
+      const params = new URLSearchParams(hash.replace("#", ""));
+      const token = params.get("calendar_token");
+      const email = params.get("calendar_email");
+      const expires = params.get("calendar_expires");
+
+      if (token) {
+        setCalendarToken(token);
+        setCalendarEmail(email ? decodeURIComponent(email) : null);
+        setCalendarExpires(expires ? parseInt(expires) : null);
+
+        // Add the primary user's email to attendee list
+        if (email) {
+          setAttendeeEmails((prev) => {
+            const decoded = decodeURIComponent(email);
+            return prev.includes(decoded) ? prev : [...prev, decoded];
+          });
+        }
+
+        console.log(`[Calendar] Connected: ${email}`);
+
+        // Clean up URL hash
+        window.history.replaceState(null, "", window.location.pathname);
+
+        // Show calendar connected message
+        const calMsg: Message = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `📅 **Google Calendar connected!** (${email ? decodeURIComponent(email) : "connected"})\n\nI'll now check your calendar before booking to make sure you're free. If you're booking for others, include their email addresses so I can check their calendars too.\n\n*Example: "Book 2 tickets for me and akash@gmail.com for Emo Night Brooklyn"*`,
+          timestamp: new Date(),
+          toolCalls: [
+            {
+              tool: "google_calendar",
+              status: "completed",
+              summary: `Google Calendar connected: ${email ? decodeURIComponent(email) : "connected"}`,
+            },
+          ],
+        };
+        setMessages((prev) => [...prev, calMsg]);
+      }
+    }
+
+    // Check for calendar error
+    const urlParams = new URLSearchParams(window.location.search);
+    const calError = urlParams.get("calendar_error");
+    if (calError) {
+      const errorMsg: Message = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: `❌ Google Calendar connection failed: ${calError}. You can try again or continue without calendar integration.`,
+        timestamp: new Date(),
+      };
+      setMessages((prev) => [...prev, errorMsg]);
+      window.history.replaceState(null, "", window.location.pathname);
+    }
+  }, []);
+
+  // Check if calendar token is expired
+  const isCalendarConnected =
+    calendarToken !== null &&
+    calendarExpires !== null &&
+    Date.now() < calendarExpires;
+
+  // Handle Google Calendar connect
+  const handleCalendarConnect = () => {
+    window.location.href = "/api/auth/google";
+  };
+
+  // Extract attendee emails from messages
+  const extractEmailsFromMessage = (message: string): string[] => {
+    const matches = message.match(
+      /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g
+    );
+    return matches || [];
+  };
 
   // Handle platform fee payment
   const handlePlatformPay = async (): Promise<string | null> => {
@@ -175,12 +262,24 @@ Or start simple:
       timestamp: new Date(),
     };
 
+    // Extract any emails from the message and add to attendee list
+    const newEmails = extractEmailsFromMessage(input);
+    if (newEmails.length > 0) {
+      setAttendeeEmails((prev) => {
+        const combined = Array.from(new Set([...prev, ...newEmails]));
+        return combined;
+      });
+    }
+
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setIsLoading(true);
     setActiveToolCalls([]);
 
     try {
+      // Build current attendee emails including any new ones from this message
+      const currentEmails = Array.from(new Set([...attendeeEmails, ...newEmails]));
+
       const response = await fetch("/api/agent", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -191,8 +290,9 @@ Or start simple:
             content: m.content,
           })),
           userWallet: publicKey,
-          // Send stored booking result so server can use it for email
           bookingResult: lastBookingResult,
+          calendarToken: isCalendarConnected ? calendarToken : undefined,
+          attendeeEmails: isCalendarConnected ? currentEmails : undefined,
         }),
       });
 
@@ -206,7 +306,7 @@ Or start simple:
         }
       }
 
-      // Store booking result if server returns one (after successful booking)
+      // Store booking result if server returns one
       if (data.bookingResult) {
         setLastBookingResult(data.bookingResult);
       }
@@ -254,7 +354,11 @@ Or start simple:
 
   return (
     <div className="flex flex-col h-screen bg-dark-900">
-      <Header />
+      <Header
+        calendarConnected={isCalendarConnected}
+        calendarEmail={calendarEmail}
+        onCalendarConnect={handleCalendarConnect}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         {/* Main Chat Area */}
@@ -300,14 +404,21 @@ Or start simple:
                   Powered by Solana devnet • cNFT tickets via Metaplex
                   Bubblegum • Built for KYD Labs
                 </p>
-                {publicKey && (
-                  <p className="text-xs text-gray-500">
-                    🟢{" "}
-                    <span className="font-mono">
-                      {publicKey.slice(0, 4)}...{publicKey.slice(-4)}
-                    </span>
-                  </p>
-                )}
+                <div className="flex items-center gap-3">
+                  {isCalendarConnected && (
+                    <p className="text-xs text-green-500">
+                      📅 {calendarEmail?.split("@")[0]}
+                    </p>
+                  )}
+                  {publicKey && (
+                    <p className="text-xs text-gray-500">
+                      🟢{" "}
+                      <span className="font-mono">
+                        {publicKey.slice(0, 4)}...{publicKey.slice(-4)}
+                      </span>
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
           )}

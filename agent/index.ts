@@ -4,6 +4,7 @@
 // Executes REAL Solana transactions when configured
 // Sends booking confirmation emails via Resend
 // Supports Phantom wallet for user-signed bookings
+// Google Calendar integration for availability check
 // =============================================
 
 import OpenAI from "openai";
@@ -12,6 +13,8 @@ import { discoverEvents, getStaticEventData } from "./tools/scrapeEvents";
 import {
   getMockAvailability,
   findOverlappingFreeSlots,
+  checkCalendarForEvent,
+  formatCalendarResults,
 } from "./tools/checkCalendar";
 import { matchEvents, formatMatchResults } from "./tools/matchEvents";
 import {
@@ -40,6 +43,13 @@ interface AgentState {
   lastPresentedEvents: EventMatch[];
   awaitingEmail: boolean;
   lastBookingResult: BookingResult | null;
+  // Calendar conflict state
+  awaitingBookAnyway: boolean;
+  pendingConflictBooking: {
+    event: ScrapedEvent;
+    attendees: Attendee[];
+    userWallet?: string;
+  } | null;
 }
 
 const state: AgentState = {
@@ -50,6 +60,8 @@ const state: AgentState = {
   lastPresentedEvents: [],
   awaitingEmail: false,
   lastBookingResult: null,
+  awaitingBookAnyway: false,
+  pendingConflictBooking: null,
 };
 
 // --- Devnet pricing: price / 10000 SOL ---
@@ -70,26 +82,40 @@ const LLM_MODEL = "llama-3.3-70b-versatile";
 
 // --- Classify user intent ---
 
-type UserAction = "greeting" | "search_events" | "book_ticket" | "check_calendar" | "general_question" | "confirm_booking" | "provide_email" | "cancel";
+type UserAction = "greeting" | "search_events" | "book_ticket" | "check_calendar" | "general_question" | "confirm_booking" | "provide_email" | "cancel" | "book_anyway";
 
-async function classifyAction(userMessage: string, isAwaitingConfirmation: boolean, isAwaitingEmail: boolean): Promise<UserAction> {
+async function classifyAction(userMessage: string, isAwaitingConfirmation: boolean, isAwaitingEmail: boolean, isAwaitingBookAnyway: boolean): Promise<UserAction> {
   // Quick check: email in message while awaiting email OR even without awaiting
-  // (in case state was lost due to hot reload)
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
   const hasEmail = emailRegex.test(userMessage);
   const lower = userMessage.toLowerCase();
   
-  // If message has an email and mentions sending/emailing, always treat as provide_email
-  if (hasEmail && (lower.includes("email") || lower.includes("send") || lower.includes("mail") || isAwaitingEmail)) {
+  // If message has an email and mentions sending/emailing (but NOT calendar/booking), treat as provide_email
+  const isCalendarContext = lower.includes("calendar") || lower.includes("availability") || lower.includes("free slot");
+  const isBookingContext = lower.includes("book") || lower.includes("ticket") || lower.includes("reserve");
+  const wantsEmail = lower.includes("email it") || lower.includes("send it") || lower.includes("mail it") || lower.includes("email the") || lower.includes("send the") || lower.includes("mail the") || lower.includes("send to") || lower.includes("mail to") || lower.includes("email to") || /\bemail\b/.test(lower.replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g, ""));
+  if (hasEmail && !isCalendarContext && !isBookingContext && (wantsEmail || isAwaitingEmail)) {
     return "provide_email";
   }
 
-  if (isAwaitingEmail) {
+  if (isAwaitingEmail && !isCalendarContext && !isBookingContext) {
     if (hasEmail) return "provide_email";
     if (lower.includes("no") || lower.includes("skip") || lower.includes("later")) {
       state.awaitingEmail = false;
       state.lastBookingResult = null;
       return "general_question";
+    }
+  }
+
+  // Handle "book anyway" after calendar conflict
+  if (isAwaitingBookAnyway) {
+    if (lower.includes("book anyway") || lower.includes("yes") || lower.includes("go ahead") || lower.includes("proceed") || lower.includes("ignore") || lower.includes("book it")) {
+      return "book_anyway";
+    }
+    if (lower.includes("no") || lower.includes("cancel") || lower.includes("different") || lower.includes("alternative") || lower.includes("other")) {
+      state.awaitingBookAnyway = false;
+      state.pendingConflictBooking = null;
+      return "search_events";
     }
   }
 
@@ -109,7 +135,8 @@ async function classifyAction(userMessage: string, isAwaitingConfirmation: boole
 - "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
 - "cancel" — user wants to cancel, start over, or reset
 ${isAwaitingConfirmation ? "\nIMPORTANT: The agent just showed event options. If the user is selecting or confirming, classify as 'confirm_booking'." : ""}
-${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the message contains an email address, classify as 'provide_email'." : ""}`,
+${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the message contains an email address, classify as 'provide_email'." : ""}
+${isAwaitingBookAnyway ? "\nIMPORTANT: The agent warned about a calendar conflict. If user says yes/go ahead/book anyway, classify as 'confirm_booking'. If they want alternatives, classify as 'search_events'." : ""}`,
       },
       { role: "user", content: userMessage },
     ],
@@ -118,7 +145,7 @@ ${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the mess
   });
 
   const action = (response.choices[0]?.message?.content || "general_question").trim().replace(/"/g, "").toLowerCase() as UserAction;
-  const validActions: UserAction[] = ["greeting", "search_events", "book_ticket", "check_calendar", "general_question", "confirm_booking", "provide_email", "cancel"];
+  const validActions: UserAction[] = ["greeting", "search_events", "book_ticket", "check_calendar", "general_question", "confirm_booking", "provide_email", "cancel", "book_anyway"];
   return validActions.includes(action) ? action : "general_question";
 }
 
@@ -190,13 +217,22 @@ function extractEmail(message: string): string | null {
   return match ? match[0] : null;
 }
 
+// --- Extract emails from message for calendar ---
+
+function extractEmails(message: string): string[] {
+  const matches = message.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+  return matches || [];
+}
+
 // --- Main Agent Handler ---
 
 export async function handleMessage(
   userMessage: string,
   conversationHistory: ChatMessage[],
   userWallet?: string,
-  clientBookingResult?: BookingResult
+  clientBookingResult?: BookingResult,
+  calendarToken?: string,
+  attendeeEmails?: string[]
 ): Promise<{
   response: string;
   toolCalls: ToolCallResult[];
@@ -205,6 +241,7 @@ export async function handleMessage(
   walletAction?: any;
   pendingBooking?: any;
   bookingResult?: BookingResult | null;
+  needsEmails?: boolean;
 }> {
   const toolCalls: ToolCallResult[] = [];
 
@@ -216,7 +253,7 @@ export async function handleMessage(
   }
 
   try {
-    const action = await classifyAction(userMessage, state.awaitingConfirmation, state.awaitingEmail);
+    const action = await classifyAction(userMessage, state.awaitingConfirmation, state.awaitingEmail, state.awaitingBookAnyway);
     console.log(`[Agent] Classified action: ${action}`);
 
     switch (action) {
@@ -237,18 +274,29 @@ export async function handleMessage(
       case "search_events":
         return await handleEventSearch(userMessage, conversationHistory, toolCalls);
       case "book_ticket":
-        return await handleBookingRequest(userMessage, conversationHistory, toolCalls, userWallet);
+        return await handleBookingRequest(userMessage, conversationHistory, toolCalls, userWallet, calendarToken, attendeeEmails);
       case "confirm_booking": {
         if (state.awaitingConfirmation && state.lastPresentedEvents.length > 0) {
-          return await handleBookingConfirmation(userMessage, toolCalls, userWallet);
+          return await handleBookingConfirmation(userMessage, toolCalls, userWallet, calendarToken, attendeeEmails);
         }
         return await handleEventSearch(userMessage, conversationHistory, toolCalls);
+      }
+      case "book_anyway": {
+        // User chose to book despite calendar conflict
+        if (state.pendingConflictBooking) {
+          const { event, attendees, userWallet: wallet } = state.pendingConflictBooking;
+          state.awaitingBookAnyway = false;
+          state.pendingConflictBooking = null;
+          // Skip calendar check, go straight to payment
+          return await proceedToPayment(event, attendees, toolCalls, wallet);
+        }
+        return { response: "No pending booking to confirm. Try searching for events first!", toolCalls: [] };
       }
       case "provide_email":
         return await handleEmailSend(userMessage, toolCalls);
       case "check_calendar": {
         const response = await generateResponse(userMessage, conversationHistory,
-          "The user wants to check calendar availability. Ask them: 1) Who are the attendees? 2) What dates/days? Once you have this info, you can check their Google Calendars for free slots."
+          "The user wants to check calendar availability. Let them know that if Google Calendar is connected, I'll automatically check everyone's calendars when they book tickets. They just need to include email addresses when booking (e.g., 'Book 2 tickets for me and akash@gmail.com')."
         );
         return { response, toolCalls };
       }
@@ -263,7 +311,7 @@ export async function handleMessage(
   }
 }
 
-// --- Handle Event Search ---
+// --- Handle Event Search (UNCHANGED) ---
 
 async function handleEventSearch(userMessage: string, conversationHistory: ChatMessage[], toolCalls: ToolCallResult[]) {
   toolCalls.push({ tool: "discover_events", status: "running", summary: "Scanning KYD-powered venues for events..." });
@@ -296,11 +344,15 @@ async function handleEventSearch(userMessage: string, conversationHistory: ChatM
 
 // --- Handle Booking Request ---
 
-async function handleBookingRequest(userMessage: string, conversationHistory: ChatMessage[], toolCalls: ToolCallResult[], userWallet?: string) {
+async function handleBookingRequest(userMessage: string, conversationHistory: ChatMessage[], toolCalls: ToolCallResult[], userWallet?: string, calendarToken?: string, attendeeEmails?: string[]) {
   toolCalls.push({ tool: "parse_intent", status: "running", summary: "Understanding your booking request..." });
   const intent = await extractIntent(userMessage);
   state.intent = intent;
   toolCalls[toolCalls.length - 1] = { tool: "parse_intent", status: "completed", summary: `Looking for ${intent.attendees.length} ticket(s)${intent.budget ? `, under $${intent.budget}` : ""}`, data: intent };
+
+  // Extract emails from user message if provided
+  const emailsFromMessage = extractEmails(userMessage);
+  const allEmails = Array.from(new Set([...(attendeeEmails || []), ...emailsFromMessage]));
 
   toolCalls.push({ tool: "discover_events", status: "running", summary: "Scanning KYD-powered venues..." });
   let events: ScrapedEvent[];
@@ -309,7 +361,8 @@ async function handleBookingRequest(userMessage: string, conversationHistory: Ch
   toolCalls[toolCalls.length - 1] = { tool: "discover_events", status: "completed", summary: `Found ${events.length} events across KYD venues`, data: { count: events.length } };
 
   let freeSlots;
-  if (intent.checkCalendar && intent.attendees.length > 0) {
+  if (intent.checkCalendar && intent.attendees.length > 0 && !calendarToken) {
+    // Mock calendar if no Google Calendar connected
     toolCalls.push({ tool: "check_calendars", status: "running", summary: `Checking availability for ${intent.attendees.map((a) => a.name).join(" & ")}...` });
     const attendeeNames = intent.attendees.map((a) => a.name);
     const availability = getMockAvailability(attendeeNames);
@@ -330,7 +383,7 @@ async function handleBookingRequest(userMessage: string, conversationHistory: Ch
   const specificEvent = findEventByName(events, userMessage);
   if (specificEvent) {
     console.log(`[Agent] User named specific event: "${specificEvent.name}" — executing booking!`);
-    return await executeAndRespond(specificEvent, intent.attendees, toolCalls, userWallet);
+    return await executeAndRespond(specificEvent, intent.attendees, toolCalls, userWallet, calendarToken, allEmails);
   }
 
   const matchSummary = formatMatchResults(matches);
@@ -345,9 +398,75 @@ async function handleBookingRequest(userMessage: string, conversationHistory: Ch
 // --- Execute Booking and Build Response ---
 
 async function executeAndRespond(
+  event: ScrapedEvent, attendees: Attendee[], toolCalls: ToolCallResult[], userWallet?: string, calendarToken?: string, attendeeEmails?: string[]
+): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any; bookingResult?: BookingResult | null; needsEmails?: boolean }> {
+  if (attendees.length === 0) attendees = [{ name: "User" }];
+
+  // ── Google Calendar check (before payment) ──
+  if (calendarToken && attendeeEmails && attendeeEmails.length > 0 && event.date && event.time) {
+    toolCalls.push({ tool: "check_calendars", status: "running", summary: `Checking Google Calendar for ${attendeeEmails.length} attendee(s)...` });
+
+    const calResult = await checkCalendarForEvent(
+      calendarToken,
+      attendeeEmails,
+      event.date,
+      event.time,
+      event.dayOfWeek
+    );
+
+    if (calResult.success) {
+      toolCalls[toolCalls.length - 1] = {
+        tool: "check_calendars",
+        status: "completed",
+        summary: calResult.allFree
+          ? `All ${attendeeEmails.length} attendee(s) are free ✅`
+          : `Calendar conflict detected 🔴`,
+      };
+
+      if (!calResult.allFree) {
+        // Calendar conflict — warn user, ask to proceed or pick alternative
+        const calendarMsg = formatCalendarResults(calResult);
+
+        state.awaitingBookAnyway = true;
+        state.awaitingConfirmation = false;
+        state.pendingConflictBooking = { event, attendees, userWallet };
+
+        return {
+          response: `${calendarMsg}\n\n**${event.name}** is on **${event.dayOfWeek}, ${event.date} at ${event.time}**.\n\nWould you like to:\n1. **Book anyway** (ignore the conflict)\n2. **Pick a different event** (I'll find one when everyone's free)`,
+          toolCalls,
+        };
+      }
+
+      // All free — continue to payment with confirmation
+      toolCalls.push({
+        tool: "calendar_clear",
+        status: "completed",
+        summary: `All attendees confirmed free for ${event.dayOfWeek}, ${event.date} at ${event.time}`,
+      });
+    } else {
+      // Calendar check failed — proceed anyway
+      toolCalls[toolCalls.length - 1] = {
+        tool: "check_calendars",
+        status: "completed",
+        summary: `Calendar check skipped: ${calResult.error}`,
+      };
+    }
+  }
+
+  // ── Proceed to payment ──
+  return await proceedToPayment(event, attendees, toolCalls, userWallet);
+}
+
+// --- Proceed to Payment (Phantom or server-side) ---
+
+async function proceedToPayment(
   event: ScrapedEvent, attendees: Attendee[], toolCalls: ToolCallResult[], userWallet?: string
 ): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any; bookingResult?: BookingResult | null }> {
-  if (attendees.length === 0) attendees = [{ name: "User" }];
+
+  // Build calendar status message if we checked
+  const calendarNote = toolCalls.some((tc) => tc.tool === "calendar_clear")
+    ? `\n\n✅ **Calendar check:** All attendees are free at event time!\n`
+    : "";
 
   // ── Phantom wallet connected → require wallet confirmation ──
   if (userWallet) {
@@ -366,7 +485,7 @@ async function executeAndRespond(
       toolCalls.push({ tool: "wallet_confirmation", status: "completed", summary: "Requesting wallet signature for free ticket booking" });
 
       return {
-        response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**\n\nThis is a **free event** — no payment required. Please sign the confirmation message in your Phantom wallet to proceed.\n\n*Your wallet will be asked to sign a message (no SOL will be charged).*`,
+        response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**${calendarNote}\n\nThis is a **free event** — no payment required. Please sign the confirmation message in your Phantom wallet to proceed.\n\n*Your wallet will be asked to sign a message (no SOL will be charged).*`,
         toolCalls,
         walletAction: { type: "sign_message", message: confirmMessage },
         pendingBooking: { event, attendees },
@@ -378,7 +497,7 @@ async function executeAndRespond(
       toolCalls.push({ tool: "wallet_payment", status: "completed", summary: `Requesting ${solAmount} SOL payment for $${event.price} ticket` });
 
       return {
-        response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**\n\n**Ticket Price:** $${event.price} per ticket\n**Devnet Payment:** ${solAmount} SOL per ticket (${(solAmount * attendees.length).toFixed(6)} SOL total)\n\nPlease approve the payment in your Phantom wallet.\n\n*This is a devnet transaction — no real funds are used.*`,
+        response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**${calendarNote}\n\n**Ticket Price:** $${event.price} per ticket\n**Devnet Payment:** ${solAmount} SOL per ticket (${(solAmount * attendees.length).toFixed(6)} SOL total)\n\nPlease approve the payment in your Phantom wallet.\n\n*This is a devnet transaction — no real funds are used.*`,
         toolCalls,
         walletAction: {
           type: "transfer_sol",
@@ -418,13 +537,12 @@ async function executeAndRespond(
   }
   state.awaitingConfirmation = false;
 
-  // Return bookingResult to frontend so it can send it back for email
   return { response, toolCalls, tickets: result.tickets, bookingResult: result.success ? result : null };
 }
 
 // --- Handle Booking Confirmation ---
 
-async function handleBookingConfirmation(userMessage: string, toolCalls: ToolCallResult[], userWallet?: string) {
+async function handleBookingConfirmation(userMessage: string, toolCalls: ToolCallResult[], userWallet?: string, calendarToken?: string, attendeeEmails?: string[]) {
   const message = userMessage.toLowerCase();
   let selectedIndex = -1;
 
@@ -433,6 +551,11 @@ async function handleBookingConfirmation(userMessage: string, toolCalls: ToolCal
   else if (message.includes("#3") || message === "3" || message.includes("third")) selectedIndex = 2;
   else if (message.includes("#4") || message === "4" || message.includes("fourth")) selectedIndex = 3;
   else if (message.includes("#5") || message === "5" || message.includes("fifth")) selectedIndex = 4;
+  else if (message.includes("#6") || message === "6") selectedIndex = 5;
+  else if (message.includes("#7") || message === "7") selectedIndex = 6;
+  else if (message.includes("#8") || message === "8") selectedIndex = 7;
+  else if (message.includes("#9") || message === "9") selectedIndex = 8;
+  else if (message.includes("#10") || message === "10") selectedIndex = 9;
 
   if (selectedIndex < 0 || selectedIndex >= state.lastPresentedEvents.length) {
     return { response: `I have ${state.lastPresentedEvents.length} event(s) listed. Which one? Say "book #1", "book #2", etc.`, toolCalls: [] };
@@ -440,16 +563,20 @@ async function handleBookingConfirmation(userMessage: string, toolCalls: ToolCal
 
   const selectedMatch = state.lastPresentedEvents[selectedIndex];
   const attendees = state.intent?.attendees || [{ name: "User" }];
-  return await executeAndRespond(selectedMatch.event, attendees, toolCalls, userWallet);
+
+  // Extract any emails from the current or previous messages
+  const emailsFromMessage = extractEmails(userMessage);
+  const allEmails = Array.from(new Set([...(attendeeEmails || []), ...emailsFromMessage]));
+
+  return await executeAndRespond(selectedMatch.event, attendees, toolCalls, userWallet, calendarToken, allEmails);
 }
 
-// --- Handle Email Send ---
+// --- Handle Email Send (UNCHANGED) ---
 
 async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[]) {
   const email = extractEmail(userMessage);
   if (!email) return { response: "I couldn't find a valid email address in your message. Could you share your email? (e.g., name@gmail.com)", toolCalls: [] };
   
-  // Use server state or restored client state
   if (!state.lastBookingResult) {
     console.log("[Agent] No booking result in server state — email cannot be sent");
     return { response: "I don't have a recent booking to email. Book some tickets first, then I'll send the confirmation!", toolCalls: [] };
@@ -477,7 +604,7 @@ async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[])
   }
 }
 
-// --- Execute Pending Booking (after Phantom wallet confirmation) ---
+// --- Execute Pending Booking (after Phantom wallet confirmation — UNCHANGED) ---
 
 export async function executePendingBooking(
   event: ScrapedEvent, attendees: Attendee[], userWallet: string, paymentTxHash?: string
@@ -515,7 +642,6 @@ export async function executePendingBooking(
     response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
   }
 
-  // Return bookingResult to frontend
   return { response, toolCalls, tickets: result.tickets, bookingResult: result.success ? result : null };
 }
 
@@ -529,4 +655,6 @@ export function resetAgentState() {
   state.lastPresentedEvents = [];
   state.awaitingEmail = false;
   state.lastBookingResult = null;
+  state.awaitingBookAnyway = false;
+  state.pendingConflictBooking = null;
 }

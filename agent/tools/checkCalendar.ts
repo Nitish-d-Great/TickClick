@@ -1,258 +1,344 @@
 // =============================================
-// TixAgent — Google Calendar Tool
-// Checks free/busy slots for multiple attendees
+// TixAgent — Calendar Availability Tool
+// Checks Google Calendar FreeBusy for attendees
+// Falls back to mock data if no token available
 // =============================================
 
-import { google } from "googleapis";
-import {
-  AttendeeAvailability,
-  CalendarSlot,
-  OverlappingSlot,
-} from "@/types";
+import { Attendee, OverlappingSlot } from "@/types";
 
-// --- OAuth2 Setup ---
-
-function getOAuth2Client() {
-  return new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
-  );
+export interface CalendarCheckResult {
+  success: boolean;
+  attendees: {
+    email: string;
+    name: string;
+    busy: { start: string; end: string }[];
+    isFree: boolean;
+    error?: string;
+  }[];
+  allFree: boolean;
+  error?: string;
 }
 
 /**
- * Generate the Google OAuth2 authorization URL.
- * User visits this URL to grant calendar access.
+ * Check calendar availability for a specific event time using Google Calendar FreeBusy API.
+ * Called from the server side — makes a direct request to the FreeBusy endpoint.
  */
-export function getAuthUrl(): string {
-  const oauth2Client = getOAuth2Client();
-  return oauth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope: ["https://www.googleapis.com/auth/calendar.readonly"],
-    prompt: "consent",
-  });
-}
+export async function checkCalendarForEvent(
+  calendarToken: string,
+  attendeeEmails: string[],
+  eventDate: string,    // e.g., "Feb 28"
+  eventTime: string,    // e.g., "11:00 PM"
+  eventDayOfWeek?: string
+): Promise<CalendarCheckResult> {
+  if (!calendarToken || attendeeEmails.length === 0) {
+    return { success: false, attendees: [], allFree: true, error: "No calendar token or emails" };
+  }
 
-/**
- * Exchange authorization code for tokens.
- */
-export async function getTokens(code: string) {
-  const oauth2Client = getOAuth2Client();
-  const { tokens } = await oauth2Client.getToken(code);
-  return tokens;
-}
+  // Parse event date/time into ISO format
+  const { timeMin, timeMax } = parseEventTimeRange(eventDate, eventTime);
 
-// --- Free/Busy Check ---
+  if (!timeMin || !timeMax) {
+    console.log(`[Calendar] Could not parse event time: ${eventDate} at ${eventTime}`);
+    return { success: false, attendees: [], allFree: true, error: "Could not parse event time" };
+  }
 
-/**
- * Check free/busy status for a single user's calendar.
- * Returns their availability for the next 14 days.
- */
-export async function checkCalendarAvailability(
-  accessToken: string,
-  attendeeName: string,
-  attendeeEmail: string,
-  lookAheadDays: number = 14
-): Promise<AttendeeAvailability> {
-  const oauth2Client = getOAuth2Client();
-  oauth2Client.setCredentials({ access_token: accessToken });
-
-  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
-
-  const timeMin = new Date();
-  const timeMax = new Date();
-  timeMax.setDate(timeMax.getDate() + lookAheadDays);
+  console.log(`\n[Calendar] Checking availability for event`);
+  console.log(`   Date: ${eventDate} at ${eventTime}`);
+  console.log(`   Range: ${timeMin} — ${timeMax}`);
+  console.log(`   Emails: ${attendeeEmails.join(", ")}`);
 
   try {
-    const response = await calendar.freebusy.query({
-      requestBody: {
-        timeMin: timeMin.toISOString(),
-        timeMax: timeMax.toISOString(),
-        timeZone: "America/New_York", // LPR is in NYC
-        items: [{ id: attendeeEmail }],
-      },
-    });
-
-    const busySlots =
-      response.data.calendars?.[attendeeEmail]?.busy || [];
-
-    // Convert busy slots to free slots
-    const freeSlots = computeFreeSlots(
-      timeMin,
-      timeMax,
-      busySlots.map((b) => ({
-        start: b.start || "",
-        end: b.end || "",
-      }))
+    // Call Google Calendar FreeBusy API directly
+    const freeBusyResponse = await fetch(
+      "https://www.googleapis.com/calendar/v3/freeBusy",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${calendarToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          timeMin,
+          timeMax,
+          items: attendeeEmails.map((email) => ({ id: email })),
+        }),
+      }
     );
 
-    return {
-      name: attendeeName,
-      email: attendeeEmail,
-      freeSlots,
-    };
-  } catch (error) {
-    console.error(`Calendar check failed for ${attendeeName}:`, error);
-    // Return all slots as free if calendar check fails
-    return {
-      name: attendeeName,
-      email: attendeeEmail,
-      freeSlots: generateAllSlots(timeMin, timeMax),
-    };
-  }
-}
-
-/**
- * Find overlapping free slots between multiple attendees.
- * Only returns evening slots (5 PM - 11:59 PM) since these are concert times.
- */
-export function findOverlappingFreeSlots(
-  attendees: AttendeeAvailability[],
-  preferredDays?: string[]
-): OverlappingSlot[] {
-  if (attendees.length === 0) return [];
-
-  // Start with first attendee's free slots
-  let overlapping = attendees[0].freeSlots.filter((slot) => slot.isFree);
-
-  // Intersect with each subsequent attendee
-  for (let i = 1; i < attendees.length; i++) {
-    const theirFreeSlots = attendees[i].freeSlots.filter((s) => s.isFree);
-    overlapping = overlapping.filter((slot) =>
-      theirFreeSlots.some(
-        (their) =>
-          new Date(slot.start) >= new Date(their.start) &&
-          new Date(slot.end) <= new Date(their.end)
-      )
-    );
-  }
-
-  // Convert to OverlappingSlot format
-  let results: OverlappingSlot[] = overlapping.map((slot) => {
-    const date = new Date(slot.start);
-    return {
-      date: date.toISOString().split("T")[0],
-      dayOfWeek: date.toLocaleDateString("en-US", { weekday: "long" }),
-      start: slot.start,
-      end: slot.end,
-      attendees: attendees.map((a) => a.name),
-    };
-  });
-
-  // Filter by preferred days if specified
-  if (preferredDays && preferredDays.length > 0) {
-    const preferred = preferredDays.map((d) => d.toLowerCase());
-    results = results.filter((slot) =>
-      preferred.includes(slot.dayOfWeek.toLowerCase())
-    );
-  }
-
-  return results;
-}
-
-// --- Helper Functions ---
-
-function computeFreeSlots(
-  rangeStart: Date,
-  rangeEnd: Date,
-  busySlots: { start: string; end: string }[]
-): CalendarSlot[] {
-  const freeSlots: CalendarSlot[] = [];
-  const sortedBusy = busySlots.sort(
-    (a, b) => new Date(a.start).getTime() - new Date(b.start).getTime()
-  );
-
-  // Generate day-by-day evening slots (5 PM - 11:59 PM)
-  const current = new Date(rangeStart);
-  while (current < rangeEnd) {
-    const eveningStart = new Date(current);
-    eveningStart.setHours(17, 0, 0, 0); // 5 PM
-
-    const eveningEnd = new Date(current);
-    eveningEnd.setHours(23, 59, 0, 0); // 11:59 PM
-
-    if (eveningStart > rangeStart) {
-      // Check if this evening slot overlaps with any busy period
-      const isBusy = sortedBusy.some((busy) => {
-        const busyStart = new Date(busy.start);
-        const busyEnd = new Date(busy.end);
-        return busyStart < eveningEnd && busyEnd > eveningStart;
-      });
-
-      freeSlots.push({
-        start: eveningStart.toISOString(),
-        end: eveningEnd.toISOString(),
-        isFree: !isBusy,
-      });
+    if (!freeBusyResponse.ok) {
+      const errorData = await freeBusyResponse.json();
+      console.error("[Calendar] FreeBusy API error:", errorData);
+      return {
+        success: false,
+        attendees: [],
+        allFree: true,
+        error: freeBusyResponse.status === 401
+          ? "Calendar token expired"
+          : `API error: ${errorData.error?.message || "Unknown"}`,
+      };
     }
 
-    current.setDate(current.getDate() + 1);
-  }
+    const data = await freeBusyResponse.json();
+    const calendars = data.calendars || {};
 
-  return freeSlots;
-}
+    const attendees = attendeeEmails.map((email) => {
+      const calData = calendars[email];
 
-function generateAllSlots(start: Date, end: Date): CalendarSlot[] {
-  const slots: CalendarSlot[] = [];
-  const current = new Date(start);
+      if (!calData) {
+        return {
+          email,
+          name: email.split("@")[0],
+          busy: [],
+          isFree: true,
+          error: "Calendar not accessible — may not be shared",
+        };
+      }
 
-  while (current < end) {
-    const eveningStart = new Date(current);
-    eveningStart.setHours(17, 0, 0, 0);
-    const eveningEnd = new Date(current);
-    eveningEnd.setHours(23, 59, 0, 0);
+      if (calData.errors && calData.errors.length > 0) {
+        return {
+          email,
+          name: email.split("@")[0],
+          busy: [],
+          isFree: true,
+          error: `Calendar error: ${calData.errors[0]?.reason || "unknown"}`,
+        };
+      }
 
-    slots.push({
-      start: eveningStart.toISOString(),
-      end: eveningEnd.toISOString(),
-      isFree: true,
+      const busyBlocks = (calData.busy || []).map((b: any) => ({
+        start: b.start,
+        end: b.end,
+      }));
+
+      return {
+        email,
+        name: email.split("@")[0],
+        busy: busyBlocks,
+        isFree: busyBlocks.length === 0,
+      };
     });
 
-    current.setDate(current.getDate() + 1);
-  }
+    const allFree = attendees.every((a) => a.isFree);
 
-  return slots;
+    attendees.forEach((a) => {
+      if (a.isFree) {
+        console.log(`   ✅ ${a.email}: FREE`);
+      } else {
+        console.log(`   🔴 ${a.email}: BUSY (${a.busy.length} conflict(s))`);
+      }
+    });
+
+    return { success: true, attendees, allFree };
+  } catch (err: any) {
+    console.error("[Calendar] FreeBusy error:", err.message);
+    return { success: false, attendees: [], allFree: true, error: err.message };
+  }
 }
 
-// --- Mock Calendar Data (for demo without OAuth) ---
+/**
+ * Parse event date/time strings into ISO time range.
+ * Input: "Feb 28", "11:00 PM" → { timeMin: "2026-02-28T22:30:00Z", timeMax: "2026-03-01T02:00:00Z" }
+ * We check 30 min before event start to 3 hours after (typical event window).
+ */
+function parseEventTimeRange(
+  dateStr: string,
+  timeStr: string
+): { timeMin: string | null; timeMax: string | null } {
+  try {
+    const months: Record<string, number> = {
+      jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+      jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+    };
+
+    // Parse "Feb 28", "Mar 7" etc
+    const dateMatch = dateStr.match(
+      /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})$/i
+    );
+    if (!dateMatch) return { timeMin: null, timeMax: null };
+
+    const month = months[dateMatch[1].toLowerCase()];
+    const day = parseInt(dateMatch[2]);
+    const year = new Date().getFullYear();
+
+    // Parse "11:00 PM", "6:30 PM" etc
+    const timeMatch = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+    if (!timeMatch) return { timeMin: null, timeMax: null };
+
+    let hours = parseInt(timeMatch[1]);
+    const minutes = parseInt(timeMatch[2]);
+    const ampm = timeMatch[3].toUpperCase();
+
+    if (ampm === "PM" && hours !== 12) hours += 12;
+    if (ampm === "AM" && hours === 12) hours = 0;
+
+    // Create start time (30 min before event)
+    const eventStart = new Date(year, month, day, hours, minutes);
+    const checkStart = new Date(eventStart.getTime() - 30 * 60 * 1000); // 30 min before
+    const checkEnd = new Date(eventStart.getTime() + 3 * 60 * 60 * 1000); // 3 hours after
+
+    return {
+      timeMin: checkStart.toISOString(),
+      timeMax: checkEnd.toISOString(),
+    };
+  } catch {
+    return { timeMin: null, timeMax: null };
+  }
+}
 
 /**
- * Returns mock availability for demo purposes.
- * In production, this is replaced by real Google Calendar API calls.
+ * Format calendar check results for the agent's response.
+ */
+export function formatCalendarResults(result: CalendarCheckResult): string {
+  if (!result.success) {
+    return `⚠️ Could not check calendars: ${result.error}`;
+  }
+
+  let msg = "";
+
+  if (result.allFree) {
+    msg += `✅ **All attendees are free!**\n\n`;
+    result.attendees.forEach((a) => {
+      msg += `- ${a.email}: FREE ✅`;
+      if (a.error) msg += ` _(${a.error})_`;
+      msg += `\n`;
+    });
+  } else {
+    msg += `⚠️ **Calendar Conflict Detected!**\n\n`;
+    result.attendees.forEach((a) => {
+      if (a.isFree) {
+        msg += `- ${a.email}: FREE ✅\n`;
+      } else {
+        msg += `- ${a.email}: BUSY 🔴\n`;
+        a.busy.forEach((b) => {
+          const start = new Date(b.start).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+          const end = new Date(b.end).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+          msg += `  → Busy from ${start} to ${end}\n`;
+        });
+      }
+    });
+  }
+
+  return msg;
+}
+
+// =============================================
+// MOCK DATA (used when Google Calendar is not connected)
+// =============================================
+
+export interface CalendarAvailability {
+  name: string;
+  freeSlots: {
+    date: string;
+    dayOfWeek: string;
+    startTime: string;
+    endTime: string;
+  }[];
+}
+
+/**
+ * Generate mock calendar availability for demo purposes.
  */
 export function getMockAvailability(
   attendeeNames: string[]
-): AttendeeAvailability[] {
+): CalendarAvailability[] {
   const today = new Date();
+  const availabilities: CalendarAvailability[] = [];
 
-  return attendeeNames.map((name) => {
-    const slots: CalendarSlot[] = [];
+  for (const name of attendeeNames) {
+    const freeSlots = [];
 
+    // Generate free slots for next 14 days
     for (let i = 0; i < 14; i++) {
-      const day = new Date(today);
-      day.setDate(day.getDate() + i);
+      const date = new Date(today);
+      date.setDate(today.getDate() + i);
 
-      const eveningStart = new Date(day);
-      eveningStart.setHours(17, 0, 0, 0);
-      const eveningEnd = new Date(day);
-      eveningEnd.setHours(23, 59, 0, 0);
+      const dayOfWeek = date.toLocaleDateString("en-US", { weekday: "long" });
+      const dateStr = date.toISOString().split("T")[0];
 
-      // Simulate: busy on some weekday evenings, free on weekends
-      const dayOfWeek = day.getDay();
-      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-      const isFree = isWeekend || Math.random() > 0.4;
+      // Weekdays: free evenings (6PM-11PM)
+      if (date.getDay() >= 1 && date.getDay() <= 5) {
+        // Randomly skip some days
+        if (Math.random() > 0.3) {
+          freeSlots.push({
+            date: dateStr,
+            dayOfWeek,
+            startTime: "18:00",
+            endTime: "23:00",
+          });
+        }
+      }
 
-      slots.push({
-        start: eveningStart.toISOString(),
-        end: eveningEnd.toISOString(),
-        isFree,
-      });
+      // Weekends: free most of the day
+      if (date.getDay() === 0 || date.getDay() === 6) {
+        freeSlots.push({
+          date: dateStr,
+          dayOfWeek,
+          startTime: "10:00",
+          endTime: "23:59",
+        });
+      }
     }
 
-    return {
-      name,
-      email: `${name.toLowerCase()}@example.com`,
-      freeSlots: slots,
-    };
-  });
+    availabilities.push({ name, freeSlots });
+  }
+
+  return availabilities;
+}
+
+/**
+ * Find overlapping free slots across all attendees (mock version).
+ */
+export function findOverlappingFreeSlots(
+  availabilities: CalendarAvailability[],
+  preferredDays?: string[]
+): OverlappingSlot[] {
+  if (availabilities.length === 0) return [];
+
+  const slotMap: Map<string, { count: number; slot: OverlappingSlot }> =
+    new Map();
+
+  // Use first attendee's slots as base
+  for (const slot of availabilities[0].freeSlots) {
+    const key = `${slot.date}_${slot.startTime}`;
+    slotMap.set(key, {
+      count: 1,
+      slot: {
+        date: slot.date,
+        dayOfWeek: slot.dayOfWeek,
+      } as OverlappingSlot,
+    });
+  }
+
+  // Check other attendees
+  for (let i = 1; i < availabilities.length; i++) {
+    const attendee = availabilities[i];
+    for (const slot of attendee.freeSlots) {
+      const key = `${slot.date}_${slot.startTime}`;
+      if (slotMap.has(key)) {
+        const entry = slotMap.get(key)!;
+        entry.count++;
+      }
+    }
+  }
+
+  // Filter to only fully overlapping slots
+  let overlapping = Array.from(slotMap.values())
+    .filter((entry) => entry.count === availabilities.length)
+    .map((entry) => entry.slot);
+
+  // Filter by preferred days if specified
+  if (preferredDays && preferredDays.length > 0) {
+    const prefLower = preferredDays.map((d) => d.toLowerCase());
+    const filtered = overlapping.filter((slot) =>
+      prefLower.some(
+        (pref) =>
+          slot.dayOfWeek.toLowerCase().includes(pref) ||
+          pref.includes("weekend") &&
+            (slot.dayOfWeek.toLowerCase().includes("sat") ||
+              slot.dayOfWeek.toLowerCase().includes("sun"))
+      )
+    );
+    if (filtered.length > 0) overlapping = filtered;
+  }
+
+  return overlapping.slice(0, 10);
 }
