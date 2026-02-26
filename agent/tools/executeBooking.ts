@@ -57,7 +57,6 @@ export async function executeBooking(
   console.log(`${"=".repeat(60)}`);
   console.log(`   Attendees: ${attendees.map((a) => a.name).join(", ")}`);
   console.log(`   Price: ${event.isFree ? "FREE" : `$${event.price}`}`);
-  console.log(`   Booking fee: ${BOOKING_FEE_SOL} SOL per ticket`);
   console.log(`   Total tickets: ${attendees.length}`);
 
   // Verify environment
@@ -192,9 +191,6 @@ export function formatBookingResult(result: BookingResult): string {
   msg += `**Date:** ${extractDateFromEvent(result.event)}\n`;
   msg += `**Total:** ${result.event.isFree ? "FREE" : `$${result.totalPaid}`}\n`;
 
-  if (isReal) {
-    msg += `**Booking Fee:** ${(0.001 * result.tickets.length).toFixed(3)} SOL (devnet)\n\n`;
-  }
 
   msg += `\n**Tickets:**\n`;
   result.tickets.forEach((ticket, i) => {

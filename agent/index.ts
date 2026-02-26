@@ -151,14 +151,14 @@ async function classifyAction(userMessage: string, isAwaitingConfirmation: boole
         role: "system",
         content: `You classify user messages into one action category. Respond with ONLY one of these exact strings, nothing else:
 - "greeting" — user is saying hello, hi, hey, thank you or making casual conversation
-- "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available based on his specified conditions
+- "search_events" — user wants to find/see/discover events, shows, concerts or asks what's available based on his specified conditions
 - "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions event name, user names, specific events)
 - "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second) or explicitly naming the event whose ticket has to be booked
 - "provide_email" — user is asking to send/email booking confirmation and sending a gmail address
 - "check_calendar" — user specifically asks about calendar availability
-- "discover_music" — user wants to hear music, listen to an artist, find tracks, or asks about Audius
-- "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
-- "cancel" — user wants to cancel, start over, or reset
+- "discover_music" — user wants to hear music, listen to an artist, find tracks or asks about Audius
+- "general_question" — user asks about how the agent works, what it can do or other non-booking questions
+- "cancel" — user wants to cancel, start over or reset
 ${isAwaitingConfirmation ? "\nIMPORTANT: The agent just showed event options. If the user is selecting or confirming by saying book tickets, classify as 'confirm_booking'." : ""}
 ${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the message says to send booking confirmation to given email, classify as 'provide_email'." : ""}
 ${isAwaitingBookAnyway ? "\nIMPORTANT: The agent warned about a calendar conflict. If user says yes/go ahead/book anyway, classify as 'book_anyway'. If they want alternatives, classify as 'search_events'." : ""}`,
@@ -482,7 +482,7 @@ async function handleEventSearch(
     `STRICT RULES — VIOLATIONS WILL BREAK THE APP:\n` +
     `- ONLY show events from the list above. NEVER invent or make up events.\n` +
     `- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n` +
-    `- Do NOT fabricate event names, prices, dates, or venues.\n` +
+    `- Do NOT fabricate event names, prices, dates or venues.\n` +
     `- The prices shown are REAL prices scraped from the venue websites. TRUST THEM. Do NOT override or change any price. If an event shows $10, it costs $10 — it is NOT free. RSVP events might not be free.\n` +
     `- Do NOT claim any event is free unless the data explicitly shows "$0" or "FREE".\n` +
     `- List EVERY event from the data — do not skip any. Number each (#1, #2, etc) and ask which to book.\n` +
@@ -659,7 +659,7 @@ async function handleMusicDiscovery(
 
       return { response, toolCalls, audiusData: result };
     } else {
-      const response = `I couldn't find tracks matching "${artistName}" on Audius right now. Try a different artist name or genre, or I can show you events instead!`;
+      const response = `I couldn't find tracks matching "${artistName}" on Audius right now. Try a different artist name or genre or I can show you events instead!`;
       return { response, toolCalls, audiusData: result };
     }
   } catch (error: any) {
@@ -863,7 +863,7 @@ async function proceedToPayment(
   if (result.success) {
     state.lastBookingResult = result;
     state.awaitingEmail = true;
-    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
+    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes and Solana Explorer links.`;
   }
   state.awaitingConfirmation = false;
 
@@ -928,10 +928,10 @@ async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[])
     toolCalls[toolCalls.length - 1] = { tool: "send_email", status: "completed", summary: `Booking confirmation sent to ${email}!` };
     state.awaitingEmail = false;
     state.lastBookingResult = null;
-    return { response: `📧 **Booking confirmation sent to ${email}!**\n\nThe email includes all your ticket details, transaction hashes, wallet addresses, and Solana Explorer links. Check your inbox (and spam folder just in case).\n\nAnything else I can help with?`, toolCalls };
+    return { response: `📧 **Booking confirmation sent to ${email}!**\n\nThe email includes all your ticket details, transaction hashes, wallet addresses and Solana Explorer links. Check your inbox (and spam folder just in case).\n\nAnything else I can help with?`, toolCalls };
   } else {
     toolCalls[toolCalls.length - 1] = { tool: "send_email", status: "error", summary: `Failed to send email: ${emailResult.error}` };
-    return { response: `❌ Sorry, I couldn't send the email: ${emailResult.error}\n\nYou can try again with a different email, or I can help you with something else.`, toolCalls };
+    return { response: `❌ Sorry, I couldn't send the email: ${emailResult.error}\n\nYou can try again with a different email or I can help you with something else.`, toolCalls };
   }
 }
 
@@ -975,7 +975,7 @@ export async function executePendingBooking(
   if (result.success) {
     state.lastBookingResult = result;
     state.awaitingEmail = true;
-    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
+    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes and Solana Explorer links.`;
   }
 
   return { response, toolCalls, tickets: result.tickets, bookingResult: result.success ? result : null };

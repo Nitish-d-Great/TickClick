@@ -1,7 +1,7 @@
 # 🎟️ TixAgent — AI-Powered Ticket Booking Agent
 
-> **Solana Graveyard Hackathon × KYD Labs**
-> An AI concierge that discovers live events, checks calendar availability, and books real on-chain compressed NFT (cNFT) tickets on Solana devnet.
+> **Solana Graveyard Hackathon × KYD Labs x Audius**
+> An AI concierge that discovers live events, checks calendar availability, plays related music and books real on-chain compressed NFT (cNFT) tickets on Solana devnet.
 
 ---
 
@@ -10,11 +10,112 @@
 TixAgent is a conversational AI agent that handles the entire ticket booking lifecycle:
 
 1. **Discover Events** — Scrapes real events from KYD Labs-powered venues (Le Poisson Rouge, DJ Mike Nasty) using Puppeteer, including live pricing from individual event pages.
-2. **Understand Intent** — Parses natural language requests to extract attendees, budgets, date preferences, and genre interests.
+2. **Understand Intent** — Parses natural language requests to extract attendees, budgets, date preferences and genre interests.
 3. **Check Calendars** — Integrates with Google Calendar via OAuth 2.0 + FreeBusy API to check attendee availability and flag scheduling conflicts.
-4. **Match & Recommend** — Scores and ranks events based on user preferences, budget, and calendar availability.
-5. **Mint On-Chain Tickets** — Mints real compressed NFTs (cNFTs) on Solana devnet via Metaplex Bubblegum, with each ticket owned by the user's Phantom wallet.
-6. **Email Confirmations** — Sends booking confirmation emails via Resend with ticket details, transaction hashes, and Solana Explorer links.
+4. **Match & Recommend** — Scores and ranks events based on user preferences, budget and calendar availability.
+5. **Wallet-Gated Payments** — Enforces Phantom wallet confirmation for all bookings — SOL transfers for paid events, cryptographic message signatures for free events.
+6. **Mint On-Chain Tickets** — Mints real compressed NFTs (cNFTs) on Solana devnet via Metaplex Bubblegum, with each ticket owned by the user's Phantom wallet.
+7. **Discover Music** — Searches Audius (decentralized music protocol) for artist tracks and genre-based trending music related to booked events.
+8. **Email Confirmations** — Sends booking confirmation emails via Resend with ticket details, transaction hashes and Solana Explorer links.
+
+---
+
+## 🔌 APIs & Services Integrated
+
+This project integrates **9 external APIs and services** across AI, blockchain, identity, communication and music — wired together through a single conversational interface.
+
+### 🤖 AI & Language Model
+
+| Service | What It Does | Integration Detail |
+|---|---|---|
+| **Groq API** (Llama 3.3 70B Versatile) | Powers the entire conversational agent — intent classification, structured data extraction, genre inference and natural language responses | Two-stage LLM pipeline: zero-shot classifier (temperature 0) for action routing + JSON-mode extractor for structured booking intent. Also used for Audius genre inference when artist isn't found directly. |
+
+### ⛓️ Blockchain & Wallet
+
+| Service | What It Does | Integration Detail |
+|---|---|---|
+| **Solana Web3.js** | All on-chain transactions — SOL transfers, wallet connections, transaction confirmations | Devnet RPC calls for building, signing and confirming transactions. Platform fee transfers, ticket payment transfers and cNFT minting all go through this. |
+| **Metaplex Bubblegum** | Compressed NFT ticket minting | `mintV1` instruction against a pre-initialized Merkle tree. Each ticket is a cNFT with `leafOwner` set to the user's Phantom wallet. Venue wallet signs as tree authority (server-side). |
+| **Phantom Wallet** | User-facing wallet for payments, signatures and identity | Browser extension integration via `usePhantom` React hook. Supports `connect` (with `onlyIfTrusted` auto-reconnect), `signMessage` (free events), `signAndSendTransaction` (paid events). Survives OAuth redirects via eager reconnection. |
+
+### 📅 Calendar & Identity
+
+| Service | What It Does | Integration Detail |
+|---|---|---|
+| **Google OAuth 2.0** | Authenticates users for calendar access | Full OAuth redirect flow: `/api/auth/google` → Google consent screen → `/api/auth/google/callback` → token passed to frontend via URL hash fragment. Token stored in React state with expiry tracking. |
+| **Google Calendar API** (FreeBusy) | Checks scheduling conflicts for all attendees | FreeBusy queries for each attendee email at the event's date/time. Returns busy/free status per person. Supports checking shared calendars — a team lead can verify availability for their entire group. |
+
+### 📧 Communication
+
+| Service | What It Does | Integration Detail |
+|---|---|---|
+| **Resend API** | Sends booking confirmation emails | HTML emails containing: event details, attendee names, cNFT IDs, mint transaction hashes, Solana Explorer verification links, wallet addresses and payment information. |
+
+### 🎵 Music Discovery
+
+| Service | What It Does | Integration Detail |
+|---|---|---|
+| **Audius API** | Decentralized music discovery — artist search, track listings, genre trending | Three-step pipeline: (1) Search for artist on Audius, (2) If not found, infer genre via Groq LLM, (3) Fetch trending tracks for that genre. Returns tracks with play counts, artwork, duration and deep links to Audius. Post-booking music player renders inline with ticket cards. |
+
+### 🎫 Event Data
+
+| Service | What It Does | Integration Detail |
+|---|---|---|
+| **KYD Labs Venues** (Web Scraping) | Real-time event discovery from live venue pages | Puppeteer-based scraper hits `lpr.kydlabs.com` and `djmikenasty.kydlabs.com`. Extracts event names, dates, times, venues and prices. For paid events, follows through to individual event pages to scrape exact ticket prices (not just listing-page data). |
+
+---
+
+## 🔄 Agent Workflow Pipeline
+
+Every booking request follows an enforced 8-step pipeline. The ordering is baked into both the LLM system prompt and code-level gates — the agent **cannot** skip steps.
+
+```
+┌──────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│  1. PARSE    │───▶│  2. DISCOVER     │───▶│  3. MATCH &     │
+│  INTENT      │    │  EVENTS          │    │  FILTER         │
+│              │    │                  │    │                 │
+│ Extract:     │    │ Scrape KYD Labs  │    │ Score by budget │
+│ • attendees  │    │ venues via       │    │ genre, day,     │
+│ • budget     │    │ Puppeteer        │    │ calendar slots  │
+│ • genre      │    │                  │    │                 │
+│ • dates      │    │                  │    │                 │
+└──────────────┘    └──────────────────┘    └────────┬────────┘
+                                                     │
+                                                     ▼
+┌──────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│  6. WALLET   │◀───│  5. PRESENT      │◀───│  4. CHECK       │
+│  PAYMENT     │    │  OPTIONS         │    │  CALENDAR       │
+│              │    │                  │    │  ⚠️ MANDATORY    │
+│ Paid: SOL    │    │ Show events with │    │                 │
+│ transfer via │    │ calendar status: │    │ Google FreeBusy │
+│ Phantom      │    │ ✅ Free          │    │ for ALL         │
+│              │    │ ⚠️ Conflict      │    │ attendees       │
+│ Free: Msg    │    │ 📅 Not checked   │    │                 │
+│ signature    │    │                  │    │                 │
+└──────┬───────┘    └──────────────────┘    └─────────────────┘
+       │
+       ▼
+┌──────────────┐    ┌──────────────────┐
+│  7. MINT     │───▶│  8. EMAIL        │
+│  cNFT        │    │  CONFIRMATION    │
+│  TICKETS     │    │                  │
+│              │    │ Send via Resend  │
+│ Metaplex     │    │ with tx hashes,  │
+│ Bubblegum    │    │ Explorer links,  │
+│ mintV1       │    │ ticket details   │
+└──────────────┘    └──────────────────┘
+```
+
+### Code-Enforced Gates
+
+The pipeline isn't just a suggestion to the LLM — critical steps are **enforced in code**:
+
+| Gate | Rule | Enforcement |
+|---|---|---|
+| **Calendar Gate** | Cannot proceed to payment without calendar check (when connected) | `executeAndRespond()` blocks and requests attendee emails if calendar is connected but emails are missing |
+| **Wallet Gate** | Cannot mint paid-event tickets without wallet payment | `proceedToPayment()` blocks and asks user to connect Phantom if wallet is missing for paid events |
+| **Conflict Gate** | Cannot book conflicting events without explicit user acknowledgment | Agent sets `awaitingBookAnyway` state and requires "book anyway" confirmation |
+| **Email Gate** | Cannot email confirmation without a completed booking | `handleEmailSend()` checks `lastBookingResult` before attempting to send |
 
 ---
 
@@ -32,8 +133,11 @@ Since the project runs on **Solana devnet**, TixAgent simulates real-world ticke
 ### 📅 Book Tickets on Behalf of Anyone via Shared Calendars
 TixAgent doesn't just book for the logged-in user — it can **check availability and book tickets for any group of people** whose Google Calendars are shared with the authenticated account. A team lead can book for their entire team, a friend can book for their group — as long as calendar access is shared, the agent handles conflict detection and multi-attendee booking seamlessly.
 
+### 🎵 Audius Music Discovery
+After booking tickets, TixAgent surfaces **related music from Audius** — the decentralized music streaming protocol. The agent infers the genre of the booked event via LLM, searches Audius for matching artist tracks or trending songs and renders an inline music player with play counts, artwork and deep links to Audius. Users can also search for music directly by saying "play some jazz" or "find tracks by [artist]".
+
 ### 🧰 Live Agent Toolchain Visibility
-Every action the AI agent takes — from scraping venues to checking calendars to minting cNFTs — is displayed in a **real-time sidebar** with animated status indicators. Users watch each tool spin up, execute, and complete, providing full transparency into the agent's decision-making pipeline. Nothing happens behind a black box.
+Every action the AI agent takes — from scraping venues to checking calendars to minting cNFTs — is displayed in a **real-time sidebar** with animated status indicators. Users watch each tool spin up, execute and complete, providing full transparency into the agent's decision-making pipeline. Nothing happens behind a black box.
 
 ---
 
@@ -59,18 +163,22 @@ Every action the AI agent takes — from scraping venues to checking calendars t
 │  │  (Action)    │ │  Extractor │ │  (Conversational)   ││
 │  └──────┬──────┘ └─────┬──────┘ └─────────────────────┘│
 │         │              │                                 │
-│  ┌──────▼──────────────▼────────────────────────────┐   │
-│  │              Agent Tools                          │   │
-│  │  ┌───────────┐ ┌──────────┐ ┌─────────────────┐ │   │
-│  │  │ Scraper   │ │ Calendar │ │ Event Matcher   │ │   │
-│  │  │(Puppeteer)│ │(Google)  │ │(Score & Rank)   │ │   │
-│  │  └───────────┘ └──────────┘ └─────────────────┘ │   │
-│  │  ┌───────────────────┐ ┌───────────────────────┐│   │
-│  │  │ Booking Executor  │ │ Email Sender (Resend) ││   │
-│  │  │ (Solana cNFT Mint)│ │                       ││   │
-│  │  └────────┬──────────┘ └───────────────────────┘│   │
-│  └───────────┼──────────────────────────────────────┘   │
-└──────────────┼──────────────────────────────────────────┘
+│  ┌──────▼──────────────▼────────────────────────────────┐│
+│  │              Agent Tools                             ││
+│  │  ┌───────────┐ ┌──────────┐ ┌─────────────────┐     ││
+│  │  │ Scraper   │ │ Calendar │ │ Event Matcher   │     ││
+│  │  │(Puppeteer)│ │(Google)  │ │(Score & Rank)   │     ││
+│  │  └───────────┘ └──────────┘ └─────────────────┘     ││
+│  │  ┌───────────────────┐ ┌──────────────────────────┐ ││
+│  │  │ Booking Executor  │ │ Email Sender (Resend)    │ ││
+│  │  │ (Solana cNFT Mint)│ │                          │ ││
+│  │  └────────┬──────────┘ └──────────────────────────┘ ││
+│  │  ┌────────▼──────────┐                               ││
+│  │  │ Audius Discovery  │                               ││
+│  │  │ (Music + Genre)   │                               ││
+│  │  └───────────────────┘                               ││
+│  └──────────────────────────────────────────────────────┘│
+└──────────────────────────────────────────────────────────┘
                │
                ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -94,6 +202,7 @@ Every action the AI agent takes — from scraping venues to checking calendars t
 | Wallet | Phantom Browser Extension |
 | Scraping | Puppeteer (headless Chrome) |
 | Calendar | Google Calendar API (OAuth 2.0 + FreeBusy) |
+| Music | Audius API (decentralized music protocol) |
 | Email | Resend API |
 | Language | TypeScript |
 
@@ -110,7 +219,7 @@ Every action the AI agent takes — from scraping venues to checking calendars t
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/your-repo/tickclick.git
+git clone https://github.com/Nitish-d-Great/tickclick.git
 cd tickclick
 npm install
 ```
@@ -174,7 +283,7 @@ The user types a natural language request like:
 
 > *"Book 2 tickets for me and Akash. Under $50, prefer weekends, we like jazz. Check our calendars."*
 
-The agent scrapes KYD venues in real-time, extracts the booking intent, optionally checks Google Calendar availability, scores and ranks matching events, and presents numbered options.
+The agent scrapes KYD venues in real-time, extracts the booking intent, optionally checks Google Calendar availability, scores and ranks matching events and presents numbered options.
 
 ### Step 3 — Wallet Confirmation
 
@@ -185,9 +294,13 @@ The agent scrapes KYD venues in real-time, extracts the booking intent, optional
 
 The server mints a compressed NFT ticket for each attendee using Metaplex Bubblegum `mintV1`. The cNFT is owned by the user's Phantom wallet (`leafOwner`). Real transaction hashes are returned with Solana Explorer verification links.
 
-### Step 5 — Email Confirmation
+### Step 5 — Music Discovery
 
-The user provides their email and receives a booking confirmation with all ticket details, transaction hashes, wallet addresses, and Solana Explorer links via Resend.
+After booking, an inline Audius player appears with music related to the event. Users can also discover music independently by asking the agent.
+
+### Step 6 — Email Confirmation
+
+The user provides their email and receives a booking confirmation with all ticket details, transaction hashes, wallet addresses and Solana Explorer links via Resend.
 
 ---
 
@@ -199,6 +312,8 @@ tickclick/
 │   ├── page.tsx                    # Main page (chat + wallet gate)
 │   ├── components/
 │   │   ├── ChatWindow.tsx          # Message display with markdown
+│   │   ├── AudiusPlayer.tsx        # Post-booking music player
+│   │   ├── TicketCard.tsx          # Visual NFT ticket cards
 │   │   ├── Header.tsx              # App header
 │   │   ├── PhantomGate.tsx         # Wallet connect + pay UI
 │   │   └── ToolCallPanel.tsx       # Live tool execution sidebar
@@ -210,12 +325,16 @@ tickclick/
 │       ├── auth/google/
 │       │   ├── route.ts            # Google OAuth initiation
 │       │   └── callback/route.ts   # OAuth callback handler
-│       └── calendar/
-│           └── freebusy/route.ts   # Google FreeBusy API
+│       ├── audius/
+│       │   └── discover/route.ts   # Audius music search endpoint
+│       ├── calendar/
+│       │   └── freebusy/route.ts   # Google FreeBusy API
+│       └── ticket-metadata/
+│           └── [id]/route.ts       # On-chain NFT metadata JSON
 ├── agent/
 │   ├── index.ts                    # Main agent orchestrator
 │   ├── prompts/
-│   │   └── system.ts               # System prompt & intent extraction
+│   │   └── system.ts               # Dynamic system prompt + intent extraction
 │   └── tools/
 │       ├── scrapeEvents.ts         # Puppeteer KYD venue scraper
 │       ├── matchEvents.ts          # Event scoring & ranking
@@ -225,6 +344,7 @@ tickclick/
 │   └── usePhantom.ts               # Phantom wallet React hook
 ├── lib/
 │   ├── solana.ts                   # Solana utilities (mint, transfer, bs58)
+│   ├── audius.ts                   # Audius API client (search, trending, genres)
 │   └── email.ts                    # Resend email integration
 ├── types/
 │   └── index.ts                    # TypeScript type definitions
@@ -293,23 +413,31 @@ The agent uses a two-stage LLM pipeline:
 
 | Action | Example Triggers |
 |---|---|
-| `greeting` | "hi", "hello", casual conversation |
+| `greeting` | "hi", "hello", "thank you", casual conversation |
 | `search_events` | "what's available?", "find jazz events", "show me concerts" |
 | `book_ticket` | "book tickets for me and Akash", mentions specific events |
 | `confirm_booking` | "#1", "yes", "book it", "go ahead" |
 | `provide_email` | Contains an email address after booking |
 | `check_calendar` | "check our calendars", "when are we free" |
+| `discover_music` | "play some jazz", "find tracks by [artist]", "music for this event" |
 | `cancel` | "start over", "reset", "cancel" |
+| `book_anyway` | "book anyway", "ignore the conflict", "proceed" (after calendar conflict) |
 | `general_question` | "how does this work?", other questions |
 
-### Tool Execution Pipeline
+### Dynamic System Prompt
 
-```
-User Message → Classify → Extract Intent → Discover Events → [Check Calendars]
-    → Match & Rank → Present Options → Wallet Confirm → Mint cNFT → [Email]
+The system prompt is **not static** — it's rebuilt on every LLM call with live context:
+
+```typescript
+getSystemPrompt({
+  calendarConnected: true,        // Shows "Calendar: ✅ CONNECTED"
+  calendarEmail: "user@gmail.com",
+  walletConnected: true,          // Shows "Wallet: ✅ CONNECTED (91B1...5dp7)"
+  walletAddress: "91B1...5dp7",
+})
 ```
 
-Each tool execution is displayed in real-time in the sidebar with animated status indicators (running → completed).
+This ensures the LLM always knows the current state of calendar and wallet connections, preventing it from skipping steps that depend on connected services.
 
 ---
 
@@ -320,6 +448,7 @@ TixAgent checks real Google Calendar availability via OAuth 2.0:
 1. User connects their Google account at `/api/auth/google`
 2. Agent uses the **FreeBusy API** to check attendee calendars for conflicts
 3. If an event time overlaps with a busy slot, the agent warns before booking
+4. User can choose to "book anyway" or pick a different event
 
 **Setup:**
 1. Create OAuth 2.0 credentials in [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
@@ -350,7 +479,7 @@ TixAgent checks real Google Calendar availability via OAuth 2.0:
 
 | Venue | URL | Event Type |
 |---|---|---|
-| Le Poisson Rouge | [lpr.kydlabs.com](https://lpr.kydlabs.com) | Paid events (~$30–$40 range) |
+| Le Poisson Rouge | [lpr.kydlabs.com](https://lpr.kydlabs.com) | Paid events (~$30–$100+ range) |
 | DJ Mike Nasty | [djmikenasty.kydlabs.com](https://djmikenasty.kydlabs.com) | Mix of free RSVP + paid events |
 
 Events are scraped in real-time from KYD Labs venue pages using Puppeteer. For paid events, prices are extracted from individual event pages (not just the listing page) to ensure accuracy.
@@ -380,7 +509,9 @@ npm run scrape:test        # Test the event scraper standalone
 | Venue wallet insufficient SOL | Run `solana airdrop 2 <VENUE_PUBKEY> --url devnet` |
 | Google OAuth `invalid_client` | Re-copy Client ID + Secret from Google Cloud Console (use copy button) |
 | Phantom not detected | Install [Phantom](https://phantom.app/) browser extension |
+| Phantom disconnects after OAuth | Hook uses `connect({ onlyIfTrusted: true })` for auto-reconnect |
 | Scraper returns 0 events | Puppeteer may need `--no-sandbox` flag; check KYD venue URLs are accessible |
+| Email confirmation fails | Ensure booking was completed before requesting email — check console for `[Client] Stored bookingResult` |
 
 ---
 
@@ -389,7 +520,8 @@ npm run scrape:test        # Test the event scraper standalone
 | Bounty | Integration |
 |---|---|
 | **KYD Labs** | Real-time event scraping from KYD-powered venues, cNFT tickets for KYD events |
-| **Solana** | Real compressed NFT minting on devnet via Metaplex Bubblegum, Phantom wallet integration |
+| **Solana Main Prize** | Real compressed NFT minting on devnet via Metaplex Bubblegum, Phantom wallet integration - Most Importantly, a fully functional consumer app on Solana |
+| **Audius** | Post-booking music discovery using Audius REST API — artist search, LLM-powered genre inference and trending track surfacing with an inline player. Empowers artists by connecting live event attendees directly to their music on the decentralized protocol. |
 
 ---
 
@@ -399,4 +531,4 @@ Built for the Solana Graveyard Hackathon (February 2026).
 
 ---
 
-**Built with ❤️ by 0xNitish | Powered by Solana, KYD Labs, Metaplex Bubblegum, and Groq**
+**Built with ❤️ by 0xNitish | Powered by Solana, KYD Labs, Metaplex Bubblegum, Groq, Audius and Google Calendar**
