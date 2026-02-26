@@ -3,6 +3,7 @@
 import { useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import { TicketCardGrid } from "./TicketCard";
+import AudiusPlayer from "./AudiusPlayer";
 
 interface Message {
   id: string;
@@ -95,9 +96,18 @@ export function ChatWindow({ messages, isLoading }: ChatWindowProps) {
                 </div>
               )}
 
-              {/* Visual NFT Ticket Cards */}
+              {/* Visual NFT Ticket Cards + Audius Music Player */}
               {msg.tickets && msg.tickets.length > 0 && (
-                <TicketCardGrid tickets={msg.tickets} />
+                <>
+                  <TicketCardGrid tickets={msg.tickets} />
+
+                  {/* Audius Music Discovery — appears after ticket cards */}
+                  <AudiusPlayer
+                    artistName={msg.tickets[0]?.venue || ""}
+                    eventName={msg.tickets[0]?.eventName || ""}
+                    venueName={msg.tickets[0]?.venue || ""}
+                  />
+                </>
               )}
 
               {/* Timestamp */}

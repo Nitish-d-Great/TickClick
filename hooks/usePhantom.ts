@@ -20,7 +20,7 @@ const PLATFORM_FEE_SOL = 0.001;
 
 interface PhantomProvider {
   isPhantom?: boolean;
-  connect: () => Promise<{ publicKey: PublicKey }>;
+  connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: PublicKey }>;
   disconnect: () => Promise<void>;
   signMessage: (message: Uint8Array, encoding: string) => Promise<{ signature: Uint8Array }>;
   signAndSendTransaction: (transaction: Transaction) => Promise<{ signature: string }>;
@@ -56,9 +56,9 @@ export function usePhantom() {
   const [publicKey, setPublicKey] = useState<string | null>(null);
   const [phantomInstalled, setPhantomInstalled] = useState(false);
 
-  // Detect Phantom on mount
+  // Detect Phantom on mount + eagerly reconnect if previously approved
   useEffect(() => {
-    const checkPhantom = () => {
+    const checkPhantom = async () => {
       const p = getProvider();
       if (p) {
         setProvider(p);
@@ -66,6 +66,19 @@ export function usePhantom() {
         if (p.isConnected && p.publicKey) {
           setConnected(true);
           setPublicKey(p.publicKey.toString());
+        } else {
+          // Eagerly reconnect — silent, no popup, only works if user
+          // previously approved this dApp. Survives OAuth redirects.
+          try {
+            const resp = await p.connect({ onlyIfTrusted: true });
+            if (resp?.publicKey) {
+              setConnected(true);
+              setPublicKey(resp.publicKey.toString());
+              console.log(`[Phantom] Auto-reconnected: ${resp.publicKey.toString().slice(0, 6)}...`);
+            }
+          } catch {
+            // User hasn't approved this dApp yet — that's fine, they'll click Connect
+          }
         }
       }
     };

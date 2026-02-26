@@ -236,9 +236,29 @@ Or start simple:
         )
       );
 
-      // Store booking result for email flow
+      // ══════════════════════════════════════════════════════════════
+      // Store booking result for email flow — with fallback construction
+      // This is critical: without bookingResult, email confirmations fail
+      // ══════════════════════════════════════════════════════════════
       if (bookingData.bookingResult) {
         setLastBookingResult(bookingData.bookingResult);
+        console.log("[Client] Stored bookingResult from execute-booking response");
+      } else if (bookingData.tickets && bookingData.tickets.length > 0) {
+        // Fallback: construct bookingResult from available data
+        // Handles case where execute-booking route doesn't return bookingResult,
+        // or server state was lost between minting and response
+        const fallbackResult = {
+          success: true,
+          tickets: bookingData.tickets,
+          event: pendingBooking.event,
+          attendees: pendingBooking.attendees,
+          totalPrice: (pendingBooking.event.price || 0) * pendingBooking.attendees.length,
+          solAmount: ((pendingBooking.event.price || 0) * pendingBooking.attendees.length) / 10000,
+        };
+        setLastBookingResult(fallbackResult);
+        console.log("[Client] Constructed fallback bookingResult from tickets data");
+      } else {
+        console.warn("[Client] ⚠️ No bookingResult AND no tickets in execute-booking response — email flow will fail");
       }
 
       const bookingMsg: Message = {
@@ -318,7 +338,7 @@ Or start simple:
         }
       }
 
-      // Store booking result if server returns one
+      // Store booking result if server returns one (non-wallet flow)
       if (data.bookingResult) {
         setLastBookingResult(data.bookingResult);
       }

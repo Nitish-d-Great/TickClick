@@ -5,10 +5,11 @@
 // Sends booking confirmation emails via Resend
 // Supports Phantom wallet for user-signed bookings
 // Google Calendar integration for availability check
+// Audius music discovery for event-related tracks
 // =============================================
 
 import OpenAI from "openai";
-import { SYSTEM_PROMPT, INTENT_EXTRACTION_PROMPT } from "./prompts/system";
+import { INTENT_EXTRACTION_PROMPT, getSystemPrompt, buildPromptContext } from "./prompts/system";
 import { discoverEvents, getStaticEventData } from "./tools/scrapeEvents";
 import {
   getMockAvailability,
@@ -23,6 +24,7 @@ import {
   formatBookingResult,
 } from "./tools/executeBooking";
 import { sendBookingEmail } from "@/lib/email";
+import { discoverMusicForEvent, AUDIUS_GENRES } from "@/lib/audius";
 import {
   ChatMessage,
   UserIntent,
@@ -50,6 +52,10 @@ interface AgentState {
     attendees: Attendee[];
     userWallet?: string;
   } | null;
+  // Workflow enforcement flags
+  calendarChecked: boolean;
+  paymentConfirmed: boolean;
+  bookingExecuted: boolean;
 }
 
 const state: AgentState = {
@@ -62,6 +68,9 @@ const state: AgentState = {
   lastBookingResult: null,
   awaitingBookAnyway: false,
   pendingConflictBooking: null,
+  calendarChecked: false,
+  paymentConfirmed: false,
+  bookingExecuted: false,
 };
 
 // --- Devnet pricing: price / 10000 SOL ---
@@ -82,23 +91,32 @@ const LLM_MODEL = "llama-3.3-70b-versatile";
 
 // --- Classify user intent ---
 
-type UserAction = "greeting" | "search_events" | "book_ticket" | "check_calendar" | "general_question" | "confirm_booking" | "provide_email" | "cancel" | "book_anyway";
+type UserAction = "greeting" | "search_events" | "book_ticket" | "check_calendar" | "general_question" | "confirm_booking" | "provide_email" | "cancel" | "book_anyway" | "discover_music";
 
 async function classifyAction(userMessage: string, isAwaitingConfirmation: boolean, isAwaitingEmail: boolean, isAwaitingBookAnyway: boolean): Promise<UserAction> {
   // Quick check: email in message while awaiting email OR even without awaiting
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
   const hasEmail = emailRegex.test(userMessage);
   const lower = userMessage.toLowerCase();
-  
-  // If message has an email and mentions sending/emailing (but NOT calendar/booking), treat as provide_email
+
+  // If message has an email and mentions sending/emailing, treat as provide_email
   const isCalendarContext = lower.includes("calendar") || lower.includes("availability") || lower.includes("free slot");
-  const isBookingContext = lower.includes("book") || lower.includes("ticket") || lower.includes("reserve");
-  const wantsEmail = lower.includes("email it") || lower.includes("send it") || lower.includes("mail it") || lower.includes("email the") || lower.includes("send the") || lower.includes("mail the") || lower.includes("send to") || lower.includes("mail to") || lower.includes("email to") || /\bemail\b/.test(lower.replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/g, ""));
-  if (hasEmail && !isCalendarContext && !isBookingContext && (wantsEmail || isAwaitingEmail)) {
+  // Use word-boundary regex to avoid "gmail" matching "mail"
+  const wantsEmail = /\bsend\b/.test(lower) || /\bmail\b/.test(lower) || /\bemail\b/.test(lower) || /\bconfirmation\b/.test(lower);
+  
+  // KEY FIX: If user has an email AND wants to send something (confirmation, booking details, etc.)
+  // this is ALWAYS provide_email — even if the word "booking" appears.
+  // "Send the confirmation of booking on xyz@gmail.com" is an email request, NOT a new booking.
+  if (hasEmail && !isCalendarContext && wantsEmail) {
     return "provide_email";
   }
 
-  if (isAwaitingEmail && !isCalendarContext && !isBookingContext) {
+  // Also catch: awaiting email + user provides one (regardless of other keywords)
+  if (isAwaitingEmail && hasEmail && !isCalendarContext) {
+    return "provide_email";
+  }
+
+  if (isAwaitingEmail && !isCalendarContext) {
     if (hasEmail) return "provide_email";
     if (lower.includes("no") || lower.includes("skip") || lower.includes("later")) {
       state.awaitingEmail = false;
@@ -119,6 +137,12 @@ async function classifyAction(userMessage: string, isAwaitingConfirmation: boole
     }
   }
 
+  // Quick detect: music/Audius requests (only when NOT in a booking flow)
+  const musicKeywords = ["music", "listen", "play", "song", "track", "audius", "artist", "tune", "vibe", "playlist"];
+  if (musicKeywords.some((kw) => lower.includes(kw)) && !lower.includes("book") && !lower.includes("ticket")) {
+    return "discover_music";
+  }
+
   const client = getLLMClient();
   const response = await client.chat.completions.create({
     model: LLM_MODEL,
@@ -126,17 +150,18 @@ async function classifyAction(userMessage: string, isAwaitingConfirmation: boole
       {
         role: "system",
         content: `You classify user messages into one action category. Respond with ONLY one of these exact strings, nothing else:
-- "greeting" — user is saying hello, hi, hey, or making casual conversation
-- "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available
-- "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions booking, names, specific events)
-- "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second)
-- "provide_email" — user is providing an email address or asking to send/email booking confirmation
+- "greeting" — user is saying hello, hi, hey, thank you or making casual conversation
+- "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available based on his specified conditions
+- "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions event name, user names, specific events)
+- "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second) or explicitly naming the event whose ticket has to be booked
+- "provide_email" — user is asking to send/email booking confirmation and sending a gmail address
 - "check_calendar" — user specifically asks about calendar availability
+- "discover_music" — user wants to hear music, listen to an artist, find tracks, or asks about Audius
 - "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
 - "cancel" — user wants to cancel, start over, or reset
-${isAwaitingConfirmation ? "\nIMPORTANT: The agent just showed event options. If the user is selecting or confirming, classify as 'confirm_booking'." : ""}
-${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the message contains an email address, classify as 'provide_email'." : ""}
-${isAwaitingBookAnyway ? "\nIMPORTANT: The agent warned about a calendar conflict. If user says yes/go ahead/book anyway, classify as 'confirm_booking'. If they want alternatives, classify as 'search_events'." : ""}`,
+${isAwaitingConfirmation ? "\nIMPORTANT: The agent just showed event options. If the user is selecting or confirming by saying book tickets, classify as 'confirm_booking'." : ""}
+${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the message says to send booking confirmation to given email, classify as 'provide_email'." : ""}
+${isAwaitingBookAnyway ? "\nIMPORTANT: The agent warned about a calendar conflict. If user says yes/go ahead/book anyway, classify as 'book_anyway'. If they want alternatives, classify as 'search_events'." : ""}`,
       },
       { role: "user", content: userMessage },
     ],
@@ -145,7 +170,7 @@ ${isAwaitingBookAnyway ? "\nIMPORTANT: The agent warned about a calendar conflic
   });
 
   const action = (response.choices[0]?.message?.content || "general_question").trim().replace(/"/g, "").toLowerCase() as UserAction;
-  const validActions: UserAction[] = ["greeting", "search_events", "book_ticket", "check_calendar", "general_question", "confirm_booking", "provide_email", "cancel", "book_anyway"];
+  const validActions: UserAction[] = ["greeting", "search_events", "book_ticket", "check_calendar", "general_question", "confirm_booking", "provide_email", "cancel", "book_anyway", "discover_music"];
   return validActions.includes(action) ? action : "general_question";
 }
 
@@ -179,12 +204,27 @@ async function extractIntent(userMessage: string): Promise<UserIntent> {
   }
 }
 
-// --- Generate conversational response ---
+// --- Generate conversational response (now uses DYNAMIC system prompt) ---
 
-async function generateResponse(userMessage: string, conversationHistory: ChatMessage[], systemContext?: string): Promise<string> {
+async function generateResponse(
+  userMessage: string,
+  conversationHistory: ChatMessage[],
+  systemContext?: string,
+  promptContext?: { calendarToken?: string; calendarEmail?: string; walletAddress?: string }
+): Promise<string> {
   const client = getLLMClient();
+
+  // Build the dynamic system prompt with current connection state
+  const dynamicPrompt = getSystemPrompt(
+    buildPromptContext({
+      calendarToken: promptContext?.calendarToken,
+      calendarEmail: promptContext?.calendarEmail,
+      walletAddress: promptContext?.walletAddress,
+    })
+  );
+
   const messages: any[] = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: dynamicPrompt },
     ...conversationHistory.slice(-10).map((msg) => ({ role: msg.role as "user" | "assistant", content: msg.content })),
     { role: "user", content: userMessage },
   ];
@@ -194,20 +234,89 @@ async function generateResponse(userMessage: string, conversationHistory: ChatMe
   return response.choices[0]?.message?.content || "I'm here to help you find and book event tickets!";
 }
 
+// --- Infer genre via LLM (for Audius discovery) ---
+
+async function inferGenre(artistName: string, eventName: string, venueName: string): Promise<string> {
+  const groqApiKey = process.env.GROQ_API_KEY;
+  if (!groqApiKey) return "Electronic";
+
+  try {
+    const genreList = AUDIUS_GENRES.join(", ");
+    const client = getLLMClient();
+    const response = await client.chat.completions.create({
+      model: LLM_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: `You are a music genre classifier. Given an artist name and/or event name, respond with exactly ONE genre from this list: ${genreList}. Respond with ONLY the genre name, nothing else.`,
+        },
+        {
+          role: "user",
+          content: `Artist: "${artistName}", Event: "${eventName}", Venue: "${venueName}"`,
+        },
+      ],
+      temperature: 0,
+      max_tokens: 20,
+    });
+
+    const genre = response.choices[0]?.message?.content?.trim() || "Electronic";
+    const validGenre = AUDIUS_GENRES.find((g) => g.toLowerCase() === genre.toLowerCase());
+    if (validGenre) return validGenre;
+
+    const partialMatch = AUDIUS_GENRES.find(
+      (g) => g.toLowerCase().includes(genre.toLowerCase()) || genre.toLowerCase().includes(g.toLowerCase())
+    );
+    return partialMatch || "Electronic";
+  } catch {
+    return "Electronic";
+  }
+}
+
 // --- Find event by name ---
 
 function findEventByName(events: ScrapedEvent[], query: string): ScrapedEvent | null {
   const q = query.toLowerCase();
+
+  // Pass 1: Check if the full event name appears in the query (or vice versa)
   for (const event of events) {
     if (q.includes(event.name.toLowerCase())) return event;
     if (event.name.toLowerCase().includes(q)) return event;
   }
-  const words = q.split(/\s+/).filter((w) => w.length > 3);
+
+  // Pass 2: Score each event by how many meaningful words match
+  // Filter out generic stopwords that would cause false positives
+  const STOPWORDS = new Set([
+    "book", "booking", "tickets", "ticket", "event", "events", "name",
+    "want", "need", "please", "could", "would", "like", "some", "with",
+    "from", "that", "this", "have", "will", "your", "about", "them",
+    "show", "find", "free", "paid", "price", "under", "over", "cheap",
+    "best", "good", "near", "next", "last", "first", "second", "third",
+    "email", "gmail", "send", "mail", "confirmation",
+    "the", "and", "for", "com", "org", "net", // common noise words
+  ]);
+
+  const words = q
+    .replace(/[()'".,@]/g, " ")       // strip punctuation
+    .split(/\s+/)
+    .filter((w) => w.length > 3 && !STOPWORDS.has(w)); // min 4 chars to skip "the", "and", etc.
+
+  let bestMatch: ScrapedEvent | null = null;
+  let bestScore = 0;
+
   for (const event of events) {
     const eName = event.name.toLowerCase();
-    if (words.some((w) => eName.includes(w))) return event;
+    let score = 0;
+    for (const word of words) {
+      if (eName.includes(word)) score++;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = event;
+    }
   }
-  return null;
+
+  // Require at least 1 meaningful word match to avoid random picks
+  return bestScore >= 1 ? bestMatch : null;
 }
 
 // --- Extract email ---
@@ -242,11 +351,20 @@ export async function handleMessage(
   pendingBooking?: any;
   bookingResult?: BookingResult | null;
   needsEmails?: boolean;
+  audiusData?: any;
 }> {
   const toolCalls: ToolCallResult[] = [];
 
-  // Restore booking result from client if server state was lost (hot reload)
-  if (clientBookingResult && !state.lastBookingResult) {
+  // Build prompt context for dynamic system prompt
+  const promptCtx = {
+    calendarToken,
+    calendarEmail: attendeeEmails?.[0],
+    walletAddress: userWallet,
+  };
+
+  // ALWAYS restore booking result from client — server state is unreliable
+  // (Next.js serverless functions / hot reloads wipe module-level state)
+  if (clientBookingResult) {
     console.log("[Agent] Restoring booking result from client state");
     state.lastBookingResult = clientBookingResult;
     state.awaitingEmail = true;
@@ -258,12 +376,13 @@ export async function handleMessage(
 
     switch (action) {
       case "greeting": {
-        const response = await generateResponse(userMessage, conversationHistory);
+        const response = await generateResponse(userMessage, conversationHistory, undefined, promptCtx);
         return { response, toolCalls };
       }
       case "general_question": {
         const response = await generateResponse(userMessage, conversationHistory,
-          "Answer the user's question helpfully. You are TickClick, an AI ticketing agent that discovers events at KYD-powered venues (Le Poisson Rouge, DJ Mike Nasty), checks Google Calendar availability, and books real on-chain cNFT tickets on Solana devnet. Each booking mints a real compressed NFT and you can email booking confirmations."
+          "Answer the user's question helpfully. You are TickClick, an AI ticketing agent that discovers events at KYD-powered venues (Le Poisson Rouge, DJ Mike Nasty), checks Google Calendar availability, asks user for payment (for paid events) or message signature (for free event) and books real on-chain cNFT tickets on Solana devnet. Each booking mints a real compressed NFT and you can email booking confirmations. You also integrate with Audius for music discovery — users can listen to tracks related to events they're interested in.",
+          promptCtx
         );
         return { response, toolCalls };
       }
@@ -272,14 +391,24 @@ export async function handleMessage(
         return { response: "No problem! I've cleared everything. What would you like to do next?", toolCalls: [] };
       }
       case "search_events":
-        return await handleEventSearch(userMessage, conversationHistory, toolCalls);
-      case "book_ticket":
-        return await handleBookingRequest(userMessage, conversationHistory, toolCalls, userWallet, calendarToken, attendeeEmails);
+        return await handleEventSearch(userMessage, conversationHistory, toolCalls, calendarToken, promptCtx);
+      case "book_ticket": {
+        // Reset workflow flags for new booking attempt
+        // BUT preserve email state (lastBookingResult, awaitingEmail) in case user is mid-email-flow
+        state.calendarChecked = false;
+        state.paymentConfirmed = false;
+        state.bookingExecuted = false;
+        return await handleBookingRequest(userMessage, conversationHistory, toolCalls, userWallet, calendarToken, attendeeEmails, promptCtx);
+      }
       case "confirm_booking": {
         if (state.awaitingConfirmation && state.lastPresentedEvents.length > 0) {
+          // Reset workflow flags for new booking attempt
+          state.calendarChecked = false;
+          state.paymentConfirmed = false;
+          state.bookingExecuted = false;
           return await handleBookingConfirmation(userMessage, toolCalls, userWallet, calendarToken, attendeeEmails);
         }
-        return await handleEventSearch(userMessage, conversationHistory, toolCalls);
+        return await handleEventSearch(userMessage, conversationHistory, toolCalls, calendarToken, promptCtx);
       }
       case "book_anyway": {
         // User chose to book despite calendar conflict
@@ -287,6 +416,7 @@ export async function handleMessage(
           const { event, attendees, userWallet: wallet } = state.pendingConflictBooking;
           state.awaitingBookAnyway = false;
           state.pendingConflictBooking = null;
+          state.calendarChecked = true; // User acknowledged conflict
           // Skip calendar check, go straight to payment
           return await proceedToPayment(event, attendees, toolCalls, wallet);
         }
@@ -294,14 +424,17 @@ export async function handleMessage(
       }
       case "provide_email":
         return await handleEmailSend(userMessage, toolCalls);
+      case "discover_music":
+        return await handleMusicDiscovery(userMessage, conversationHistory, toolCalls, promptCtx);
       case "check_calendar": {
         const response = await generateResponse(userMessage, conversationHistory,
-          "The user wants to check calendar availability. Let them know that if Google Calendar is connected, I'll automatically check everyone's calendars when they book tickets. They just need to include email addresses when booking (e.g., 'Book 2 tickets for me and akash@gmail.com')."
+          "The user wants to check calendar availability. Let them know that if Google Calendar is connected, I'll automatically check everyone's calendars when they book tickets. They just need to include email addresses when booking (e.g., 'Book 2 tickets for Aman (abc@gmail.com) and Akash (akash@gmail.com)').",
+          promptCtx
         );
         return { response, toolCalls };
       }
       default: {
-        const response = await generateResponse(userMessage, conversationHistory);
+        const response = await generateResponse(userMessage, conversationHistory, undefined, promptCtx);
         return { response, toolCalls };
       }
     }
@@ -311,9 +444,15 @@ export async function handleMessage(
   }
 }
 
-// --- Handle Event Search (UNCHANGED) ---
+// --- Handle Event Search ---
 
-async function handleEventSearch(userMessage: string, conversationHistory: ChatMessage[], toolCalls: ToolCallResult[]) {
+async function handleEventSearch(
+  userMessage: string,
+  conversationHistory: ChatMessage[],
+  toolCalls: ToolCallResult[],
+  calendarToken?: string,
+  promptCtx?: { calendarToken?: string; calendarEmail?: string; walletAddress?: string }
+) {
   toolCalls.push({ tool: "discover_events", status: "running", summary: "Scanning KYD-powered venues for events..." });
 
   let events: ScrapedEvent[];
@@ -334,8 +473,24 @@ async function handleEventSearch(userMessage: string, conversationHistory: ChatM
   toolCalls.push({ tool: "match_events", status: "completed", summary: `${matches.length} event(s) match your criteria`, data: { matchCount: matches.length } });
 
   const matchSummary = formatMatchResults(matches);
+  const calendarNote = calendarToken
+    ? `\n- Google Calendar IS connected. Remind the user that calendars will be checked automatically before booking.\n`
+    : "";
+
   const response = await generateResponse(userMessage, conversationHistory,
-    `Here are the REAL events found from KYD venues:\n\n${matchSummary}\n\nIMPORTANT RULES:\n- ONLY show events from the list above. NEVER invent or make up events.\n- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n- Do NOT fabricate event names, prices, dates, or venues.\n- The prices shown are REAL prices scraped from the venue websites. TRUST THEM. Do NOT override or change any price. If an event shows $10, it costs $10 — it is NOT free.\n- Do NOT claim any event is free unless the data explicitly shows "$0" or "FREE".\n- List EVERY event from the data — do not skip any. Number each (#1, #2, etc) and ask which to book.`
+    `Here are the REAL events found from KYD venues:\n\n${matchSummary}\n\n` +
+    `STRICT RULES — VIOLATIONS WILL BREAK THE APP:\n` +
+    `- ONLY show events from the list above. NEVER invent or make up events.\n` +
+    `- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n` +
+    `- Do NOT fabricate event names, prices, dates, or venues.\n` +
+    `- The prices shown are REAL prices scraped from the venue websites. TRUST THEM. Do NOT override or change any price. If an event shows $10, it costs $10 — it is NOT free. RSVP events might not be free.\n` +
+    `- Do NOT claim any event is free unless the data explicitly shows "$0" or "FREE".\n` +
+    `- List EVERY event from the data — do not skip any. Number each (#1, #2, etc) and ask which to book.\n` +
+    `- Do NOT say "Booking Confirmed" or "Tickets booked" or anything implying a booking happened.\n` +
+    `- You are ONLY presenting options right now. The user must select one first.\n` +
+    `- Mention that users can explore related music on Audius for any event they're interested in.\n` +
+    calendarNote,
+    promptCtx
   );
 
   if (matches.length > 0) { state.awaitingConfirmation = true; state.intent = intent; }
@@ -344,7 +499,15 @@ async function handleEventSearch(userMessage: string, conversationHistory: ChatM
 
 // --- Handle Booking Request ---
 
-async function handleBookingRequest(userMessage: string, conversationHistory: ChatMessage[], toolCalls: ToolCallResult[], userWallet?: string, calendarToken?: string, attendeeEmails?: string[]) {
+async function handleBookingRequest(
+  userMessage: string,
+  conversationHistory: ChatMessage[],
+  toolCalls: ToolCallResult[],
+  userWallet?: string,
+  calendarToken?: string,
+  attendeeEmails?: string[],
+  promptCtx?: { calendarToken?: string; calendarEmail?: string; walletAddress?: string }
+) {
   toolCalls.push({ tool: "parse_intent", status: "running", summary: "Understanding your booking request..." });
   const intent = await extractIntent(userMessage);
   state.intent = intent;
@@ -388,11 +551,129 @@ async function handleBookingRequest(userMessage: string, conversationHistory: Ch
 
   const matchSummary = formatMatchResults(matches);
   const attendeeNames = intent.attendees.map((a) => a.name).join(" & ");
+  const calendarNote = calendarToken
+    ? `\n- Google Calendar IS connected. IMPORTANT: Calendar will be checked BEFORE any payment is requested. This is enforced by code.\n`
+    : "";
+
   const response = await generateResponse(userMessage, [],
-    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\nPresent ALL results with numbers (#1, #2, etc). Include all details. The prices shown are REAL and accurate — TRUST THEM. If an event shows $10, it costs $10, it is NOT free. Do NOT skip any events. Ask which event to book. Do NOT pretend to have booked anything.`
+    `Attendees: ${attendeeNames || "not specified"}\n\nHere are the matching events:\n${matchSummary}\n\n` +
+    `STRICT RULES — VIOLATIONS WILL BREAK THE APP:\n` +
+    `- Present ALL results with numbers (#1, #2, etc). Include all details.\n` +
+    `- The prices shown are REAL and accurate — TRUST THEM. If an event shows $10, it costs $10, it is NOT free.\n` +
+    `- Do NOT skip any events.\n` +
+    `- Ask which event to book.\n` +
+    `- Do NOT pretend to have booked anything.\n` +
+    `- Do NOT say "Booking Confirmed" or "Tickets booked" or anything implying a booking happened.\n` +
+    `- You are ONLY presenting options. The user must select one, then pay via wallet.\n` +
+    `- Do NOT skip the payment step. Do NOT skip the calendar check step.\n` +
+    calendarNote,
+    promptCtx
   );
   if (matches.length > 0) state.awaitingConfirmation = true;
   return { response, toolCalls, events: matches };
+}
+
+// --- Handle Music Discovery (Audius integration) ---
+
+async function handleMusicDiscovery(
+  userMessage: string,
+  conversationHistory: ChatMessage[],
+  toolCalls: ToolCallResult[],
+  promptCtx?: { calendarToken?: string; calendarEmail?: string; walletAddress?: string }
+): Promise<{
+  response: string;
+  toolCalls: ToolCallResult[];
+  audiusData?: any;
+}> {
+  const lower = userMessage.toLowerCase();
+
+  // Try to extract an artist name or genre from the message
+  let artistName = "";
+  let eventName = "";
+  let venueName = "";
+
+  // If we have events loaded, try to match against them
+  if (state.events.length > 0) {
+    const matchedEvent = findEventByName(state.events, userMessage);
+    if (matchedEvent) {
+      artistName = matchedEvent.name;
+      eventName = matchedEvent.name;
+      venueName = matchedEvent.venue;
+    }
+  }
+
+  // If no event match, use the user message as the artist/query
+  if (!artistName) {
+    // Strip common music request prefixes
+    artistName = lower
+      .replace(/play|listen to|find music|search for|tracks by|songs by|audius|music|for|by|from/gi, "")
+      .trim();
+    if (!artistName) artistName = "Electronic"; // fallback
+  }
+
+  toolCalls.push({
+    tool: "audius_discover",
+    status: "running",
+    summary: `Searching Audius for "${artistName}"...`,
+  });
+
+  try {
+    // Infer genre for fallback
+    const genre = await inferGenre(artistName, eventName, venueName);
+
+    // Discover music
+    const result = await discoverMusicForEvent(artistName, genre);
+
+    toolCalls[toolCalls.length - 1] = {
+      tool: "audius_discover",
+      status: "completed",
+      summary:
+        result.tracks.length > 0
+          ? `Found ${result.tracks.length} tracks ${result.source === "artist_match" ? `by ${result.artist?.name}` : `in ${result.genre}`} on Audius`
+          : "No tracks found on Audius",
+      data: { trackCount: result.tracks.length, source: result.source, genre: result.genre },
+    };
+
+    if (result.tracks.length > 0) {
+      let response = "";
+      if (result.source === "artist_match" && result.artist) {
+        response = `🎵 **Found ${result.artist.name} on Audius!**${result.artist.isVerified ? " ✅" : ""}\n\n`;
+        response += `${result.artist.followerCount.toLocaleString()} followers · ${result.artist.trackCount} tracks\n\n`;
+        response += `**Top Tracks:**\n`;
+      } else {
+        response = `🎵 **Trending ${result.genre} tracks on Audius:**\n\n`;
+      }
+
+      result.tracks.forEach((track, i) => {
+        const mins = Math.floor(track.duration / 60);
+        const secs = track.duration % 60;
+        response += `${i + 1}. **${track.title}** by ${track.artistName} (${mins}:${secs.toString().padStart(2, "0")})\n`;
+        response += `   ${track.playCount.toLocaleString()} plays · [Listen on Audius](https://audius.co${track.permalink})\n\n`;
+      });
+
+      if (result.audiusProfileUrl) {
+        response += `\n🔗 [View full profile on Audius](${result.audiusProfileUrl})`;
+      }
+
+      response += `\n\nWant me to find events to attend? Just say "show me events"!`;
+
+      return { response, toolCalls, audiusData: result };
+    } else {
+      const response = `I couldn't find tracks matching "${artistName}" on Audius right now. Try a different artist name or genre, or I can show you events instead!`;
+      return { response, toolCalls, audiusData: result };
+    }
+  } catch (error: any) {
+    console.error("[Agent] Audius discovery error:", error);
+    toolCalls[toolCalls.length - 1] = {
+      tool: "audius_discover",
+      status: "error",
+      summary: `Audius search failed: ${error.message}`,
+    };
+    return {
+      response: "I had trouble connecting to Audius right now. Want me to help you find events instead?",
+      toolCalls,
+    };
+  }
 }
 
 // --- Execute Booking and Build Response ---
@@ -402,58 +683,91 @@ async function executeAndRespond(
 ): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any; bookingResult?: BookingResult | null; needsEmails?: boolean }> {
   if (attendees.length === 0) attendees = [{ name: "User" }];
 
-  // ── Google Calendar check (before payment) ──
-  if (calendarToken && attendeeEmails && attendeeEmails.length > 0 && event.date && event.time) {
-    toolCalls.push({ tool: "check_calendars", status: "running", summary: `Checking Google Calendar for ${attendeeEmails.length} attendee(s)...` });
+  // ══════════════════════════════════════════════════════════════
+  // STEP 4 ENFORCED: Google Calendar check (code-gated, NOT LLM-decided)
+  // This runs BEFORE any payment/booking regardless of LLM behavior
+  // ══════════════════════════════════════════════════════════════
+  if (calendarToken) {
+    // Calendar IS connected — we MUST check it before proceeding
 
-    const calResult = await checkCalendarForEvent(
-      calendarToken,
-      attendeeEmails,
-      event.date,
-      event.time,
-      event.dayOfWeek
-    );
-
-    if (calResult.success) {
-      toolCalls[toolCalls.length - 1] = {
-        tool: "check_calendars",
-        status: "completed",
-        summary: calResult.allFree
-          ? `All ${attendeeEmails.length} attendee(s) are free ✅`
-          : `Calendar conflict detected 🔴`,
-      };
-
-      if (!calResult.allFree) {
-        // Calendar conflict — warn user, ask to proceed or pick alternative
-        const calendarMsg = formatCalendarResults(calResult);
-
-        state.awaitingBookAnyway = true;
-        state.awaitingConfirmation = false;
-        state.pendingConflictBooking = { event, attendees, userWallet };
-
-        return {
-          response: `${calendarMsg}\n\n**${event.name}** is on **${event.dayOfWeek}, ${event.date} at ${event.time}**.\n\nWould you like to:\n1. **Book anyway** (ignore the conflict)\n2. **Pick a different event** (I'll find one when everyone's free)`,
-          toolCalls,
-        };
-      }
-
-      // All free — continue to payment with confirmation
-      toolCalls.push({
-        tool: "calendar_clear",
-        status: "completed",
-        summary: `All attendees confirmed free for ${event.dayOfWeek}, ${event.date} at ${event.time}`,
-      });
-    } else {
-      // Calendar check failed — proceed anyway
-      toolCalls[toolCalls.length - 1] = {
-        tool: "check_calendars",
-        status: "completed",
-        summary: `Calendar check skipped: ${calResult.error}`,
+    if (!attendeeEmails || attendeeEmails.length === 0) {
+      // Calendar connected but no emails — ASK for them, don't silently skip
+      console.log("[Agent] Calendar connected but no attendee emails — requesting emails");
+      return {
+        response: `📅 **Google Calendar is connected** — I need attendee email addresses to check for conflicts before booking.\n\nPlease share the email(s) for your group so I can verify everyone's free for **${event.name}** on **${event.dayOfWeek || ""} ${event.date || ""} ${event.time || ""}**.\n\n*Example: "My email is abc@gmail.com and my friend's is xyz@gmail.com"*`,
+        toolCalls,
+        needsEmails: true,
       };
     }
+
+    if (event.date && event.time) {
+      // We have everything needed — run the calendar check
+      toolCalls.push({ tool: "check_calendars", status: "running", summary: `Checking Google Calendar for ${attendeeEmails.length} attendee(s)...` });
+
+      const calResult = await checkCalendarForEvent(
+        calendarToken,
+        attendeeEmails,
+        event.date,
+        event.time,
+        event.dayOfWeek
+      );
+
+      state.calendarChecked = true; // ← Mark as checked regardless of result
+
+      if (calResult.success) {
+        toolCalls[toolCalls.length - 1] = {
+          tool: "check_calendars",
+          status: "completed",
+          summary: calResult.allFree
+            ? `All ${attendeeEmails.length} attendee(s) are free ✅`
+            : `Calendar conflict detected 🔴`,
+        };
+
+        if (!calResult.allFree) {
+          // Calendar conflict — warn user, ask to proceed or pick alternative
+          const calendarMsg = formatCalendarResults(calResult);
+
+          state.awaitingBookAnyway = true;
+          state.awaitingConfirmation = false;
+          state.pendingConflictBooking = { event, attendees, userWallet };
+
+          return {
+            response: `${calendarMsg}\n\n**${event.name}** is on **${event.dayOfWeek}, ${event.date} at ${event.time}**.\n\nWould you like to:\n1. **Book anyway** (ignore the conflict)\n2. **Pick a different event** (I'll find one when everyone's free)`,
+            toolCalls,
+          };
+        }
+
+        // All free — add confirmation tool call and continue to payment
+        toolCalls.push({
+          tool: "calendar_clear",
+          status: "completed",
+          summary: `All attendees confirmed free for ${event.dayOfWeek}, ${event.date} at ${event.time}`,
+        });
+      } else {
+        // Calendar API call failed — log it, proceed anyway
+        toolCalls[toolCalls.length - 1] = {
+          tool: "check_calendars",
+          status: "completed",
+          summary: `Calendar check failed: ${calResult.error} — proceeding anyway`,
+        };
+      }
+    } else {
+      // No date/time on event — can't check calendar, log explicitly
+      toolCalls.push({
+        tool: "check_calendars",
+        status: "completed",
+        summary: `Calendar check skipped: event date/time not available in scraped data`,
+      });
+      state.calendarChecked = true;
+    }
+  } else {
+    // No calendar connected — mark as N/A and proceed
+    state.calendarChecked = true;
   }
 
-  // ── Proceed to payment ──
+  // ══════════════════════════════════════════════════════════════
+  // STEP 6: Proceed to payment (only after calendar check passed/skipped)
+  // ══════════════════════════════════════════════════════════════
   return await proceedToPayment(event, attendees, toolCalls, userWallet);
 }
 
@@ -463,12 +777,20 @@ async function proceedToPayment(
   event: ScrapedEvent, attendees: Attendee[], toolCalls: ToolCallResult[], userWallet?: string
 ): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any; bookingResult?: BookingResult | null }> {
 
+  // SAFETY: Log if calendar wasn't checked (should not happen with code gates)
+  if (!state.calendarChecked) {
+    console.warn("[Agent] ⚠️ WARNING: Proceeding to payment without calendar check! This should not happen.");
+  }
+
   // Build calendar status message if we checked
   const calendarNote = toolCalls.some((tc) => tc.tool === "calendar_clear")
     ? `\n\n✅ **Calendar check:** All attendees are free at event time!\n`
     : "";
 
-  // ── Phantom wallet connected → require wallet confirmation ──
+  // ══════════════════════════════════════════════════════════════
+  // Phantom wallet connected → REQUIRE wallet confirmation
+  // This is code-enforced — the LLM cannot skip this
+  // ══════════════════════════════════════════════════════════════
   if (userWallet) {
     const isFree = event.isFree || event.price === 0;
 
@@ -484,6 +806,8 @@ async function proceedToPayment(
 
       toolCalls.push({ tool: "wallet_confirmation", status: "completed", summary: "Requesting wallet signature for free ticket booking" });
 
+      state.paymentConfirmed = false; // Will be true after wallet signs
+
       return {
         response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**${calendarNote}\n\nThis is a **free event** — no payment required. Please sign the confirmation message in your Phantom wallet to proceed.\n\n*Your wallet will be asked to sign a message (no SOL will be charged).*`,
         toolCalls,
@@ -495,6 +819,8 @@ async function proceedToPayment(
       const venueWallet = process.env.VENUE_WALLET_PUBLIC_KEY || "AMowwS1iaoKZMMwJxWY5jdeCKukbm64XyZEg8fwbXCPw";
 
       toolCalls.push({ tool: "wallet_payment", status: "completed", summary: `Requesting ${solAmount} SOL payment for $${event.price} ticket` });
+
+      state.paymentConfirmed = false; // Will be true after wallet pays
 
       return {
         response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**${calendarNote}\n\n**Ticket Price:** $${event.price} per ticket\n**Devnet Payment:** ${solAmount} SOL per ticket (${(solAmount * attendees.length).toFixed(6)} SOL total)\n\nPlease approve the payment in your Phantom wallet.\n\n*This is a devnet transaction — no real funds are used.*`,
@@ -510,7 +836,9 @@ async function proceedToPayment(
     }
   }
 
-  // ── No wallet → auto-execute (venue pays) ──
+  // ══════════════════════════════════════════════════════════════
+  // No wallet → auto-execute (venue pays) — server-side minting
+  // ══════════════════════════════════════════════════════════════
   toolCalls.push({ tool: "execute_booking", status: "running", summary: `Booking "${event.name}" for ${attendees.map((a) => a.name).join(" & ")}...` });
 
   let result;
@@ -528,6 +856,8 @@ async function proceedToPayment(
     summary: result.success ? `Booked ${result.tickets.length} ticket(s) on Solana!` : `Booking failed: ${result.error}`,
     data: result,
   };
+
+  state.bookingExecuted = true;
 
   let response = formatBookingResult(result);
   if (result.success) {
@@ -568,15 +898,16 @@ async function handleBookingConfirmation(userMessage: string, toolCalls: ToolCal
   const emailsFromMessage = extractEmails(userMessage);
   const allEmails = Array.from(new Set([...(attendeeEmails || []), ...emailsFromMessage]));
 
+  // This flows through executeAndRespond which enforces calendar → payment → mint
   return await executeAndRespond(selectedMatch.event, attendees, toolCalls, userWallet, calendarToken, allEmails);
 }
 
-// --- Handle Email Send (UNCHANGED) ---
+// --- Handle Email Send ---
 
 async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[]) {
   const email = extractEmail(userMessage);
   if (!email) return { response: "I couldn't find a valid email address in your message. Could you share your email? (e.g., name@gmail.com)", toolCalls: [] };
-  
+
   if (!state.lastBookingResult) {
     console.log("[Agent] No booking result in server state — email cannot be sent");
     return { response: "I don't have a recent booking to email. Book some tickets first, then I'll send the confirmation!", toolCalls: [] };
@@ -604,7 +935,7 @@ async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[])
   }
 }
 
-// --- Execute Pending Booking (after Phantom wallet confirmation — UNCHANGED) ---
+// --- Execute Pending Booking (after Phantom wallet confirmation) ---
 
 export async function executePendingBooking(
   event: ScrapedEvent, attendees: Attendee[], userWallet: string, paymentTxHash?: string
@@ -615,6 +946,9 @@ export async function executePendingBooking(
   console.log(`   Event: ${event.name}`);
   console.log(`   Wallet: ${userWallet}`);
   console.log(`   Payment Tx: ${paymentTxHash || "N/A (free)"}`);
+
+  // Mark payment as confirmed (wallet signed/paid)
+  state.paymentConfirmed = true;
 
   toolCalls.push({ tool: "execute_booking", status: "running", summary: `Minting cNFT tickets for "${event.name}"...` });
 
@@ -631,6 +965,8 @@ export async function executePendingBooking(
     summary: result.success ? `Minted ${result.tickets.length} cNFT ticket(s) on Solana!` : `Booking failed: ${result.error}`,
     data: result,
   };
+
+  state.bookingExecuted = true;
 
   let response = formatBookingResult(result);
   if (paymentTxHash && result.success) {
@@ -657,4 +993,7 @@ export function resetAgentState() {
   state.lastBookingResult = null;
   state.awaitingBookAnyway = false;
   state.pendingConflictBooking = null;
+  state.calendarChecked = false;
+  state.paymentConfirmed = false;
+  state.bookingExecuted = false;
 }

@@ -40,6 +40,7 @@ export async function POST(request: NextRequest) {
       response: result.response,
       toolCalls: result.toolCalls,
       tickets: result.tickets || [],
+      bookingResult: result.bookingResult || null, // ← THIS WAS MISSING
     });
   } catch (error: any) {
     console.error("[Execute-Booking] Error:", error);
@@ -49,6 +50,7 @@ export async function POST(request: NextRequest) {
         response: `❌ Booking failed: ${error.message}. Please try again.`,
         toolCalls: [],
         tickets: [],
+        bookingResult: null,
       },
       { status: 500 }
     );
