@@ -1,6 +1,9 @@
 // =============================================
 // Google OAuth — Redirect to Google consent screen
 // GET /api/auth/google
+//
+// SCOPE CHANGE: calendar.events replaces calendar.readonly
+// calendar.events includes: read events, write events, AND freebusy access
 // =============================================
 
 import { NextRequest, NextResponse } from "next/server";
@@ -17,7 +20,7 @@ export async function GET(request: NextRequest) {
   }
 
   const scopes = [
-    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.freebusy",
   ].join(" ");
 

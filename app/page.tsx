@@ -24,7 +24,7 @@ export default function Home() {
       role: "assistant",
       content: `Hey! 👋 I'm **TixAgent** — your AI concierge for live events.
 
-Tell me what you're looking for and I'll find the perfect show, check everyone's calendars and book on-chain tickets for you.
+Tell me what you're looking for and I'll find the perfect show, check everyone's calendars, and book on-chain tickets for you.
 
 **Try saying something like:**
 > "Book 2 tickets for me (abc@email.com) and my friend Akash (xyz@email.com). Check our calendars. Under $50, prefer weekends."
@@ -166,7 +166,7 @@ Or start simple:
         const paymentMsg: Message = {
           id: crypto.randomUUID(),
           role: "assistant",
-          content: `✅ **Wallet connected & platform fee paid!**\n\nWelcome aboard! Your wallet \`${publicKey?.slice(0, 6)}...${publicKey?.slice(-4)}\` is connected.\n\n🔗 [View payment on Explorer](https://explorer.solana.com/tx/${sig}?cluster=devnet)\n\nYou can now search events, book tickets and get email confirmations. What would you like to do?`,
+          content: `✅ **Wallet connected & platform fee paid!**\n\nWelcome aboard! Your wallet \`${publicKey?.slice(0, 6)}...${publicKey?.slice(-4)}\` is connected.\n\n🔗 [View payment on Explorer](https://explorer.solana.com/tx/${sig}?cluster=devnet)\n\nYou can now search events, book tickets, and get email confirmations. What would you like to do?`,
           timestamp: new Date(),
           toolCalls: [
             {
@@ -224,6 +224,9 @@ Or start simple:
           userWallet: publicKey,
           paymentTxHash: txHash,
           walletSignature: signature,
+          // Pass calendar data so post-booking event creation works
+          calendarToken: (pendingBooking as any).calendarToken || (isCalendarConnected ? calendarToken : undefined),
+          attendeeEmails: (pendingBooking as any).attendeeEmails || (isCalendarConnected ? attendeeEmails : undefined),
         }),
       });
 

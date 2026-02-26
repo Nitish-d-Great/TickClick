@@ -2,6 +2,7 @@
 // TixAgent — Execute Booking API Route
 // POST /api/agent/execute-booking
 // Called after Phantom wallet confirmation
+// Now also passes calendarToken for post-booking event creation
 // =============================================
 
 import { NextRequest, NextResponse } from "next/server";
@@ -10,8 +11,15 @@ import { executePendingBooking } from "@/agent";
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { event, attendees, userWallet, paymentTxHash, walletSignature } =
-      body;
+    const {
+      event,
+      attendees,
+      userWallet,
+      paymentTxHash,
+      walletSignature,
+      calendarToken,
+      attendeeEmails,
+    } = body;
 
     if (!event || !attendees || !userWallet) {
       return NextResponse.json(
@@ -25,6 +33,7 @@ export async function POST(request: NextRequest) {
     console.log(`   Attendees: ${attendees.map((a: any) => a.name).join(", ")}`);
     console.log(`   Wallet: ${userWallet.slice(0, 8)}...`);
     console.log(`   Payment Tx: ${paymentTxHash || "N/A (free event)"}`);
+    console.log(`   Calendar: ${calendarToken ? "connected" : "not connected"}`);
     console.log(
       `   Wallet Signature: ${walletSignature ? walletSignature.slice(0, 16) + "..." : "N/A"}`
     );
@@ -33,14 +42,16 @@ export async function POST(request: NextRequest) {
       event,
       attendees,
       userWallet,
-      paymentTxHash
+      paymentTxHash,
+      calendarToken || undefined,
+      attendeeEmails || undefined
     );
 
     return NextResponse.json({
       response: result.response,
       toolCalls: result.toolCalls,
       tickets: result.tickets || [],
-      bookingResult: result.bookingResult || null, // ← THIS WAS MISSING
+      bookingResult: result.bookingResult || null,
     });
   } catch (error: any) {
     console.error("[Execute-Booking] Error:", error);

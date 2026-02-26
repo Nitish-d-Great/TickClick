@@ -16,6 +16,7 @@ import {
   findOverlappingFreeSlots,
   checkCalendarForEvent,
   formatCalendarResults,
+  createCalendarEvent,
 } from "./tools/checkCalendar";
 import { matchEvents, formatMatchResults } from "./tools/matchEvents";
 import {
@@ -51,6 +52,8 @@ interface AgentState {
     event: ScrapedEvent;
     attendees: Attendee[];
     userWallet?: string;
+    calendarToken?: string;
+    attendeeEmails?: string[];
   } | null;
   // Workflow enforcement flags
   calendarChecked: boolean;
@@ -151,14 +154,14 @@ async function classifyAction(userMessage: string, isAwaitingConfirmation: boole
         role: "system",
         content: `You classify user messages into one action category. Respond with ONLY one of these exact strings, nothing else:
 - "greeting" — user is saying hello, hi, hey, thank you or making casual conversation
-- "search_events" — user wants to find/see/discover events, shows, concerts or asks what's available based on his specified conditions
+- "search_events" — user wants to find/see/discover events, shows, concerts, or asks what's available based on his specified conditions
 - "book_ticket" — user explicitly wants to book/purchase/reserve tickets (mentions event name, user names, specific events)
 - "confirm_booking" — user is confirming a previous selection (saying yes, book it, go ahead, #1, #2, first, second) or explicitly naming the event whose ticket has to be booked
 - "provide_email" — user is asking to send/email booking confirmation and sending a gmail address
 - "check_calendar" — user specifically asks about calendar availability
-- "discover_music" — user wants to hear music, listen to an artist, find tracks or asks about Audius
-- "general_question" — user asks about how the agent works, what it can do or other non-booking questions
-- "cancel" — user wants to cancel, start over or reset
+- "discover_music" — user wants to hear music, listen to an artist, find tracks, or asks about Audius
+- "general_question" — user asks about how the agent works, what it can do, or other non-booking questions
+- "cancel" — user wants to cancel, start over, or reset
 ${isAwaitingConfirmation ? "\nIMPORTANT: The agent just showed event options. If the user is selecting or confirming by saying book tickets, classify as 'confirm_booking'." : ""}
 ${isAwaitingEmail ? "\nIMPORTANT: The agent just asked for an email. If the message says to send booking confirmation to given email, classify as 'provide_email'." : ""}
 ${isAwaitingBookAnyway ? "\nIMPORTANT: The agent warned about a calendar conflict. If user says yes/go ahead/book anyway, classify as 'book_anyway'. If they want alternatives, classify as 'search_events'." : ""}`,
@@ -418,7 +421,7 @@ export async function handleMessage(
           state.pendingConflictBooking = null;
           state.calendarChecked = true; // User acknowledged conflict
           // Skip calendar check, go straight to payment
-          return await proceedToPayment(event, attendees, toolCalls, wallet);
+          return await proceedToPayment(event, attendees, toolCalls, wallet, calendarToken, attendeeEmails);
         }
         return { response: "No pending booking to confirm. Try searching for events first!", toolCalls: [] };
       }
@@ -482,7 +485,7 @@ async function handleEventSearch(
     `STRICT RULES — VIOLATIONS WILL BREAK THE APP:\n` +
     `- ONLY show events from the list above. NEVER invent or make up events.\n` +
     `- If the list is empty or says "no matches", tell the user no events matched and suggest they try different criteria.\n` +
-    `- Do NOT fabricate event names, prices, dates or venues.\n` +
+    `- Do NOT fabricate event names, prices, dates, or venues.\n` +
     `- The prices shown are REAL prices scraped from the venue websites. TRUST THEM. Do NOT override or change any price. If an event shows $10, it costs $10 — it is NOT free. RSVP events might not be free.\n` +
     `- Do NOT claim any event is free unless the data explicitly shows "$0" or "FREE".\n` +
     `- List EVERY event from the data — do not skip any. Number each (#1, #2, etc) and ask which to book.\n` +
@@ -659,7 +662,7 @@ async function handleMusicDiscovery(
 
       return { response, toolCalls, audiusData: result };
     } else {
-      const response = `I couldn't find tracks matching "${artistName}" on Audius right now. Try a different artist name or genre or I can show you events instead!`;
+      const response = `I couldn't find tracks matching "${artistName}" on Audius right now. Try a different artist name or genre, or I can show you events instead!`;
       return { response, toolCalls, audiusData: result };
     }
   } catch (error: any) {
@@ -763,18 +766,29 @@ async function executeAndRespond(
   } else {
     // No calendar connected — mark as N/A and proceed
     state.calendarChecked = true;
+
+    // WARN if user provided emails (they likely expect calendar check)
+    if (attendeeEmails && attendeeEmails.length > 0) {
+      console.log("[Agent] ⚠️ User provided emails but Google Calendar is NOT connected — skipping calendar check");
+      toolCalls.push({
+        tool: "check_calendars",
+        status: "completed",
+        summary: `⚠️ Calendar not connected — connect Google Calendar to check conflicts before booking`,
+      });
+    }
   }
 
   // ══════════════════════════════════════════════════════════════
   // STEP 6: Proceed to payment (only after calendar check passed/skipped)
   // ══════════════════════════════════════════════════════════════
-  return await proceedToPayment(event, attendees, toolCalls, userWallet);
+  return await proceedToPayment(event, attendees, toolCalls, userWallet, calendarToken, attendeeEmails);
 }
 
 // --- Proceed to Payment (Phantom or server-side) ---
 
 async function proceedToPayment(
-  event: ScrapedEvent, attendees: Attendee[], toolCalls: ToolCallResult[], userWallet?: string
+  event: ScrapedEvent, attendees: Attendee[], toolCalls: ToolCallResult[], userWallet?: string,
+  calendarToken?: string, attendeeEmails?: string[]
 ): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; walletAction?: any; pendingBooking?: any; bookingResult?: BookingResult | null }> {
 
   // SAFETY: Log if calendar wasn't checked (should not happen with code gates)
@@ -783,9 +797,13 @@ async function proceedToPayment(
   }
 
   // Build calendar status message if we checked
-  const calendarNote = toolCalls.some((tc) => tc.tool === "calendar_clear")
+  const calendarClearNote = toolCalls.some((tc) => tc.tool === "calendar_clear")
     ? `\n\n✅ **Calendar check:** All attendees are free at event time!\n`
     : "";
+  const calendarWarningNote = toolCalls.some((tc) => tc.tool === "check_calendars" && tc.summary?.includes("not connected"))
+    ? `\n\n⚠️ **Google Calendar is not connected** — I couldn't check for scheduling conflicts. [Reconnect Calendar] to verify availability before booking.\n`
+    : "";
+  const calendarNote = calendarClearNote || calendarWarningNote;
 
   // ══════════════════════════════════════════════════════════════
   // Phantom wallet connected → REQUIRE wallet confirmation
@@ -812,7 +830,7 @@ async function proceedToPayment(
         response: `🎟️ **Ready to book ${attendees.length} ticket(s) for "${event.name}"!**${calendarNote}\n\nThis is a **free event** — no payment required. Please sign the confirmation message in your Phantom wallet to proceed.\n\n*Your wallet will be asked to sign a message (no SOL will be charged).*`,
         toolCalls,
         walletAction: { type: "sign_message", message: confirmMessage },
-        pendingBooking: { event, attendees },
+        pendingBooking: { event, attendees, calendarToken, attendeeEmails },
       };
     } else {
       const solAmount = calculateDevnetSol(event.price);
@@ -831,14 +849,33 @@ async function proceedToPayment(
           recipient: venueWallet,
           description: `${attendees.length}x ${event.name} — $${event.price * attendees.length} (${(solAmount * attendees.length).toFixed(6)} SOL devnet)`,
         },
-        pendingBooking: { event, attendees },
+        pendingBooking: { event, attendees, calendarToken, attendeeEmails },
       };
     }
   }
 
   // ══════════════════════════════════════════════════════════════
-  // No wallet → auto-execute (venue pays) — server-side minting
+  // No wallet → check if event is PAID before auto-executing
+  // For paid events: REQUIRE wallet connection (don't silently skip payment)
+  // For free events: allow server-side booking
   // ══════════════════════════════════════════════════════════════
+  const isFreeEvent = event.isFree || event.price === 0;
+
+  if (!isFreeEvent) {
+    // PAID event without wallet — block and ask user to connect
+    console.log(`[Agent] ⚠️ Paid event ($${event.price}) but no wallet connected — blocking booking`);
+    toolCalls.push({
+      tool: "wallet_required",
+      status: "error",
+      summary: `Wallet required for paid event ($${event.price}) — please connect Phantom wallet`,
+    });
+    return {
+      response: `💰 **"${event.name}" costs $${event.price} per ticket** ($${event.price * attendees.length} total for ${attendees.length} ticket(s)).\n\n🔗 **Please connect your Phantom wallet** to proceed with payment. Click the **"Solana Devnet"** button in the top-right corner to connect.\n\n*Payment is on Solana devnet — no real funds are used. Once connected, just repeat your booking request and I'll process everything!*`,
+      toolCalls,
+    };
+  }
+
+  // FREE event — can proceed with server-side booking (no payment needed)
   toolCalls.push({ tool: "execute_booking", status: "running", summary: `Booking "${event.name}" for ${attendees.map((a) => a.name).join(" & ")}...` });
 
   let result;
@@ -859,11 +896,45 @@ async function proceedToPayment(
 
   state.bookingExecuted = true;
 
+  // ══════════════════════════════════════════════════════════════
+  // STEP 7.5: Create Google Calendar event (if calendar connected)
+  // ══════════════════════════════════════════════════════════════
+  let calendarEventMsg = "";
+  if (calendarToken && result.success && event.date && event.time) {
+    const calEventResult = await createCalendarEvent(calendarToken, {
+      eventName: event.name,
+      venueName: event.venue,
+      eventDate: event.date,
+      eventTime: event.time,
+      durationMinutes: 120,
+      attendeeEmails: attendeeEmails || [],
+      ticketIds: result.tickets?.map((t: any) => t.assetId || t.cNftId) || [],
+      transactionHashes: result.tickets?.map((t: any) => t.mintTx) || [],
+      eventDayOfWeek: event.dayOfWeek,
+    });
+
+    if (calEventResult.success) {
+      toolCalls.push({
+        tool: "create_calendar_event",
+        status: "completed",
+        summary: `📅 Added "${event.name}" to Google Calendar — invites sent to all attendees!`,
+      });
+      calendarEventMsg = `\n\n📅 **Added to Google Calendar!** ${calEventResult.eventLink ? `[View event](${calEventResult.eventLink})` : ""}  \nAll attendees will receive calendar invites.`;
+    } else {
+      toolCalls.push({
+        tool: "create_calendar_event",
+        status: "error",
+        summary: `Calendar event creation failed: ${calEventResult.error}`,
+      });
+    }
+  }
+
   let response = formatBookingResult(result);
+  if (calendarEventMsg) response += calendarEventMsg;
   if (result.success) {
     state.lastBookingResult = result;
     state.awaitingEmail = true;
-    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes and Solana Explorer links.`;
+    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
   }
   state.awaitingConfirmation = false;
 
@@ -928,17 +999,18 @@ async function handleEmailSend(userMessage: string, toolCalls: ToolCallResult[])
     toolCalls[toolCalls.length - 1] = { tool: "send_email", status: "completed", summary: `Booking confirmation sent to ${email}!` };
     state.awaitingEmail = false;
     state.lastBookingResult = null;
-    return { response: `📧 **Booking confirmation sent to ${email}!**\n\nThe email includes all your ticket details, transaction hashes, wallet addresses and Solana Explorer links. Check your inbox (and spam folder just in case).\n\nAnything else I can help with?`, toolCalls };
+    return { response: `📧 **Booking confirmation sent to ${email}!**\n\nThe email includes all your ticket details, transaction hashes, wallet addresses, and Solana Explorer links. Check your inbox (and spam folder just in case).\n\nAnything else I can help with?`, toolCalls };
   } else {
     toolCalls[toolCalls.length - 1] = { tool: "send_email", status: "error", summary: `Failed to send email: ${emailResult.error}` };
-    return { response: `❌ Sorry, I couldn't send the email: ${emailResult.error}\n\nYou can try again with a different email or I can help you with something else.`, toolCalls };
+    return { response: `❌ Sorry, I couldn't send the email: ${emailResult.error}\n\nYou can try again with a different email, or I can help you with something else.`, toolCalls };
   }
 }
 
 // --- Execute Pending Booking (after Phantom wallet confirmation) ---
 
 export async function executePendingBooking(
-  event: ScrapedEvent, attendees: Attendee[], userWallet: string, paymentTxHash?: string
+  event: ScrapedEvent, attendees: Attendee[], userWallet: string, paymentTxHash?: string,
+  calendarToken?: string, attendeeEmails?: string[]
 ): Promise<{ response: string; toolCalls: ToolCallResult[]; tickets?: any[]; bookingResult?: BookingResult | null }> {
   const toolCalls: ToolCallResult[] = [];
 
@@ -946,6 +1018,7 @@ export async function executePendingBooking(
   console.log(`   Event: ${event.name}`);
   console.log(`   Wallet: ${userWallet}`);
   console.log(`   Payment Tx: ${paymentTxHash || "N/A (free)"}`);
+  console.log(`   Calendar: ${calendarToken ? "connected" : "not connected"}`);
 
   // Mark payment as confirmed (wallet signed/paid)
   state.paymentConfirmed = true;
@@ -968,14 +1041,48 @@ export async function executePendingBooking(
 
   state.bookingExecuted = true;
 
+  // ══════════════════════════════════════════════════════════════
+  // STEP 7.5: Create Google Calendar event (if calendar connected)
+  // ══════════════════════════════════════════════════════════════
+  let calendarEventMsg = "";
+  if (calendarToken && result.success && event.date && event.time) {
+    const calEventResult = await createCalendarEvent(calendarToken, {
+      eventName: event.name,
+      venueName: event.venue,
+      eventDate: event.date,
+      eventTime: event.time,
+      durationMinutes: 120,
+      attendeeEmails: attendeeEmails || [],
+      ticketIds: result.tickets?.map((t: any) => t.assetId || t.cNftId) || [],
+      transactionHashes: result.tickets?.map((t: any) => t.mintTx) || [],
+      eventDayOfWeek: event.dayOfWeek,
+    });
+
+    if (calEventResult.success) {
+      toolCalls.push({
+        tool: "create_calendar_event",
+        status: "completed",
+        summary: `📅 Added "${event.name}" to Google Calendar — invites sent to all attendees!`,
+      });
+      calendarEventMsg = `\n\n📅 **Added to Google Calendar!** ${calEventResult.eventLink ? `[View event](${calEventResult.eventLink})` : ""}  \nAll attendees will receive calendar invites.`;
+    } else {
+      toolCalls.push({
+        tool: "create_calendar_event",
+        status: "error",
+        summary: `Calendar event creation failed: ${calEventResult.error}`,
+      });
+    }
+  }
+
   let response = formatBookingResult(result);
+  if (calendarEventMsg) response += calendarEventMsg;
   if (paymentTxHash && result.success) {
     response += `\n\n💳 **Your payment:** [View on Explorer](https://explorer.solana.com/tx/${paymentTxHash}?cluster=devnet)`;
   }
   if (result.success) {
     state.lastBookingResult = result;
     state.awaitingEmail = true;
-    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes and Solana Explorer links.`;
+    response += `\n\n📧 **Would you like me to email the booking confirmation?** Just share your email address and I'll send you all the ticket details, transaction hashes, and Solana Explorer links.`;
   }
 
   return { response, toolCalls, tickets: result.tickets, bookingResult: result.success ? result : null };

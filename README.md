@@ -11,7 +11,7 @@ TixAgent is a conversational AI agent that handles the entire ticket booking lif
 
 1. **Discover Events** — Scrapes real events from KYD Labs-powered venues (Le Poisson Rouge, DJ Mike Nasty) using Puppeteer, including live pricing from individual event pages.
 2. **Understand Intent** — Parses natural language requests to extract attendees, budgets, date preferences and genre interests.
-3. **Check Calendars** — Integrates with Google Calendar via OAuth 2.0 + FreeBusy API to check attendee availability and flag scheduling conflicts.
+3. **Check Calendars & Auto-Book Events** — Integrates with Google Calendar via OAuth 2.0 to check attendee availability before booking, and automatically creates a calendar event with invites for all attendees after a successful booking.
 4. **Match & Recommend** — Scores and ranks events based on user preferences, budget and calendar availability.
 5. **Wallet-Gated Payments** — Enforces Phantom wallet confirmation for all bookings — SOL transfers for paid events, cryptographic message signatures for free events.
 6. **Mint On-Chain Tickets** — Mints real compressed NFTs (cNFTs) on Solana devnet via Metaplex Bubblegum, with each ticket owned by the user's Phantom wallet.
@@ -42,8 +42,8 @@ This project integrates **9 external APIs and services** across AI, blockchain, 
 
 | Service | What It Does | Integration Detail |
 |---|---|---|
-| **Google OAuth 2.0** | Authenticates users for calendar access | Full OAuth redirect flow: `/api/auth/google` → Google consent screen → `/api/auth/google/callback` → token passed to frontend via URL hash fragment. Token stored in React state with expiry tracking. |
-| **Google Calendar API** (FreeBusy) | Checks scheduling conflicts for all attendees | FreeBusy queries for each attendee email at the event's date/time. Returns busy/free status per person. Supports checking shared calendars — a team lead can verify availability for their entire group. |
+| **Google OAuth 2.0** | Authenticates users for calendar access | Full OAuth redirect flow: `/api/auth/google` → Google consent screen → `/api/auth/google/callback` → token passed to frontend via URL hash fragment. Token stored in React state with expiry tracking. Uses `calendar.events` scope for both read and write access. |
+| **Google Calendar API** (FreeBusy + Events) | Pre-booking conflict detection and post-booking event creation | **Before booking:** FreeBusy queries check each attendee's calendar for conflicts. **After booking:** Creates a 2-hour calendar event with venue location, on-chain ticket details in the description, and sends Google Calendar invites to all attendees automatically via `sendUpdates=all`. |
 
 ### 📧 Communication
 
@@ -67,7 +67,7 @@ This project integrates **9 external APIs and services** across AI, blockchain, 
 
 ## 🔄 Agent Workflow Pipeline
 
-Every booking request follows an enforced 8-step pipeline. The ordering is baked into both the LLM system prompt and code-level gates — the agent **cannot** skip steps.
+Every booking request follows an enforced 9-step pipeline. The ordering is baked into both the LLM system prompt and code-level gates — the agent **cannot** skip steps.
 
 ```
 ┌──────────────┐    ┌──────────────────┐    ┌─────────────────┐
@@ -95,15 +95,16 @@ Every booking request follows an enforced 8-step pipeline. The ordering is baked
 └──────┬───────┘    └──────────────────┘    └─────────────────┘
        │
        ▼
-┌──────────────┐    ┌──────────────────┐
-│  7. MINT     │───▶│  8. EMAIL        │
-│  cNFT        │    │  CONFIRMATION    │
-│  TICKETS     │    │                  │
-│              │    │ Send via Resend  │
-│ Metaplex     │    │ with tx hashes,  │
-│ Bubblegum    │    │ Explorer links,  │
-│ mintV1       │    │ ticket details   │
-└──────────────┘    └──────────────────┘
+┌──────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│  7. MINT     │───▶│  8. ADD TO       │───▶│  9. EMAIL       │
+│  cNFT        │    │  CALENDAR        │    │  CONFIRMATION   │
+│  TICKETS     │    │  📅 AUTO         │    │                 │
+│              │    │                  │    │ Send via Resend  │
+│ Metaplex     │    │ Create event on  │    │ with tx hashes,  │
+│ Bubblegum    │    │ Google Calendar  │    │ Explorer links,  │
+│ mintV1       │    │ + send invites   │    │ ticket details   │
+│              │    │ to all attendees │    │                 │
+└──────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
 ### Code-Enforced Gates
@@ -129,6 +130,9 @@ Free doesn't mean unsigned. When a user books a free event, TixAgent prompts a *
 
 ### 💸 Real On-Chain Payments for Paid Events
 Since the project runs on **Solana devnet**, TixAgent simulates real-world ticket economics using a deterministic pricing formula: **`ticket_price_usd / 10,000` SOL**. A $50 ticket costs 0.005 devnet SOL. The user approves a real SOL transfer through Phantom to the venue wallet — producing a fully verifiable payment transaction on Solana Explorer, identical to how a production deployment would work on mainnet.
+
+### 📅 Automatic Google Calendar Booking with Attendee Invites
+After a successful ticket booking, TixAgent **automatically creates a Google Calendar event** for the show — blocked as a 2-hour slot at the event's start time, with the venue as the location and on-chain ticket details (cNFT IDs, Solana Explorer links) embedded in the event description. All attendees receive **Google Calendar invites automatically**, so everyone's calendar is blocked and nobody forgets the show. No manual step needed — it happens right after minting.
 
 ### 📅 Book Tickets on Behalf of Anyone via Shared Calendars
 TixAgent doesn't just book for the logged-in user — it can **check availability and book tickets for any group of people** whose Google Calendars are shared with the authenticated account. A team lead can book for their entire team, a friend can book for their group — as long as calendar access is shared, the agent handles conflict detection and multi-attendee booking seamlessly.
@@ -201,7 +205,7 @@ Every action the AI agent takes — from scraping venues to checking calendars t
 | Blockchain | Solana devnet, Metaplex Bubblegum (cNFTs), `@solana/web3.js` |
 | Wallet | Phantom Browser Extension |
 | Scraping | Puppeteer (headless Chrome) |
-| Calendar | Google Calendar API (OAuth 2.0 + FreeBusy) |
+| Calendar | Google Calendar API (OAuth 2.0 + FreeBusy + Events) |
 | Music | Audius API (decentralized music protocol) |
 | Email | Resend API |
 | Language | TypeScript |
@@ -294,11 +298,15 @@ The agent scrapes KYD venues in real-time, extracts the booking intent, optional
 
 The server mints a compressed NFT ticket for each attendee using Metaplex Bubblegum `mintV1`. The cNFT is owned by the user's Phantom wallet (`leafOwner`). Real transaction hashes are returned with Solana Explorer verification links.
 
-### Step 5 — Music Discovery
+### Step 5 — Automatic Calendar Booking
+
+If Google Calendar is connected, TixAgent automatically creates a calendar event for the show — a 2-hour block at the event's start time with the venue as the location. All attendees receive Google Calendar invites, so everyone's schedule is blocked. On-chain ticket details (cNFT IDs, Explorer links) are embedded in the event description.
+
+### Step 6 — Music Discovery
 
 After booking, an inline Audius player appears with music related to the event. Users can also discover music independently by asking the agent.
 
-### Step 6 — Email Confirmation
+### Step 7 — Email Confirmation
 
 The user provides their email and receives a booking confirmation with all ticket details, transaction hashes, wallet addresses and Solana Explorer links via Resend.
 
@@ -338,7 +346,7 @@ tickclick/
 │   └── tools/
 │       ├── scrapeEvents.ts         # Puppeteer KYD venue scraper
 │       ├── matchEvents.ts          # Event scoring & ranking
-│       ├── checkCalendar.ts        # Calendar availability checker
+│       ├── checkCalendar.ts        # Calendar checker + event creator
 │       └── executeBooking.ts       # Solana cNFT minting + booking
 ├── hooks/
 │   └── usePhantom.ts               # Phantom wallet React hook
@@ -382,6 +390,14 @@ Metaplex Bubblegum mintV1()
         │
         ▼
 Real tx hash returned → Solana Explorer link
+        │
+        ▼
+Google Calendar event auto-created
+  ├── summary = "🎟️ Event Name"
+  ├── location = venue name
+  ├── duration = 2 hours
+  ├── description = cNFT IDs + Explorer links
+  └── attendees = all emails → calendar invites sent
 ```
 
 **Key points:**
@@ -389,6 +405,7 @@ Real tx hash returned → Solana Explorer link
 - The **user's Phantom wallet** is set as the `leafOwner` — they own the cNFT
 - Phantom is used for platform fee payment and booking confirmation signatures, **not** for signing the mint tx
 - Each cNFT costs ~0.00005 SOL to mint (paid by venue wallet)
+- After minting, a **Google Calendar event is automatically created** with invites sent to all attendees
 
 ### Verifying Tickets
 
@@ -443,18 +460,28 @@ This ensures the LLM always knows the current state of calendar and wallet conne
 
 ## 🗓️ Google Calendar Integration
 
-TixAgent checks real Google Calendar availability via OAuth 2.0:
+TixAgent uses Google Calendar for both **pre-booking conflict detection** and **post-booking event creation**:
 
+### Before Booking (FreeBusy API)
 1. User connects their Google account at `/api/auth/google`
 2. Agent uses the **FreeBusy API** to check attendee calendars for conflicts
 3. If an event time overlaps with a busy slot, the agent warns before booking
 4. User can choose to "book anyway" or pick a different event
 
-**Setup:**
+### After Booking (Events API)
+5. Once tickets are minted, agent **automatically creates a Google Calendar event**
+6. Event includes: 🎟️ event name as title, venue as location, 2-hour duration
+7. On-chain ticket details (cNFT IDs, Solana Explorer links) are embedded in the event description
+8. All attendees receive **Google Calendar invites** automatically via `sendUpdates=all`
+9. Reminders are set for 1 day before and 1 hour before the event
+
+### Setup
 1. Create OAuth 2.0 credentials in [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
 2. Enable the **Google Calendar API**
 3. Add test users in OAuth consent screen → Test users (while in "Testing" mode)
 4. Set redirect URI to `http://localhost:3000/api/auth/google/callback`
+
+**OAuth Scope:** The app requests `calendar.events` — this allows both reading availability and creating events. Users will see a consent screen asking to "View and edit events on all your calendars".
 
 **Calendar sharing:** For checking other people's calendars, they need to share their calendar with the authenticated user's email (Settings → Share with specific people → "See all event details").
 
@@ -508,6 +535,7 @@ npm run scrape:test        # Test the event scraper standalone
 | Booking falls back to simulation | Check `.env.local` has `MERKLE_TREE_ADDRESS` + `USER_WALLET_PUBLIC_KEY` set |
 | Venue wallet insufficient SOL | Run `solana airdrop 2 <VENUE_PUBKEY> --url devnet` |
 | Google OAuth `invalid_client` | Re-copy Client ID + Secret from Google Cloud Console (use copy button) |
+| Calendar event creation fails (403) | Reconnect Google Calendar — the app needs `calendar.events` scope for write access |
 | Phantom not detected | Install [Phantom](https://phantom.app/) browser extension |
 | Phantom disconnects after OAuth | Hook uses `connect({ onlyIfTrusted: true })` for auto-reconnect |
 | Scraper returns 0 events | Puppeteer may need `--no-sandbox` flag; check KYD venue URLs are accessible |
