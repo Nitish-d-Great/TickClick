@@ -255,6 +255,7 @@ VENUE_WALLET_KEYPAIR_PATH=./wallets/venue-wallet.json
 VENUE_WALLET_PUBLIC_KEY=<your-venue-wallet-pubkey>
 USER_WALLET_PUBLIC_KEY=<your-phantom-wallet-pubkey>
 SOLANA_RPC_URL=https://api.devnet.solana.com
+SOLANA_NETWORK=devnet
 
 # Email
 RESEND_API_KEY=re_...
